@@ -391,6 +391,10 @@ type (
 		User string `yaml:"user"`
 		// Password is the password corresponding to the user name
 		Password string `yaml:"password"`
+		// EnableEntraAuth is true if the SQL plugin uses Entra ID authentication Password is ignored in this case
+		EnableEntraAuth bool `yaml:"enableEntraAuth"`
+		// EntraScope is the scope to get the access token
+		EntraScope string `yaml:"entraScope"`
 		// PluginName is the name of SQL plugin
 		PluginName string `yaml:"pluginName" validate:"nonzero"`
 		// DatabaseName is the name of SQL database to connect to
