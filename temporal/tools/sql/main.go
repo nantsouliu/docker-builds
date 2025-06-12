@@ -58,7 +58,7 @@ func BuildCLIOptions() *cli.App {
 	app := cli.NewApp()
 	app.Name = "temporal-sql-tool"
 	app.Usage = "Command line tool for temporal sql operations"
-	app.Version = "0.0.1"
+	app.Version = "0.0.2"
 
 	logger := log.NewCLILogger()
 
@@ -86,6 +86,17 @@ func BuildCLIOptions() *cli.App {
 			Value:  "",
 			Usage:  "password used for authentication when connecting to sql host",
 			EnvVar: "SQL_PASSWORD",
+		},
+		cli.BoolFlag{
+			Name:  schema.CLIFlagEnableEntraAuth,
+			Usage: "enable Entra ID authentication for SQL connection",
+			EnvVar: "SQL_ENABLE_ENTRA_AUTH",
+		},
+		cli.StringFlag{
+			Name:   schema.CLIFlagEntraScope,
+			Value:  "https://ossrdbms-aad.database.windows.net/.default",
+			Usage:  "resource scope for Entra ID authentication",
+			EnvVar: "SQL_ENTRA_SCOPE",
 		},
 		cli.StringFlag{
 			Name:   schema.CLIFlagDatabase,
