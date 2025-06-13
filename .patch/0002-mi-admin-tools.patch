@@ -1,0 +1,84 @@
+From ea2a350966ab3d9b2c75d0669968f8e61adc28c6 Mon Sep 17 00:00:00 2001
+From: Joey Liu <nantsouliu@microsoft.com>
+Date: Thu, 12 Jun 2025 05:51:32 +0000
+Subject: [PATCH] mi supporting postgres in admin-tools
+
+---
+ temporal/tools/common/schema/types.go |  8 ++++++++
+ temporal/tools/sql/handler.go         |  2 ++
+ temporal/tools/sql/main.go            | 13 ++++++++++++-
+ 3 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/temporal/tools/common/schema/types.go b/temporal/tools/common/schema/types.go
+index 9d97db7..a6e7172 100644
+--- a/temporal/tools/common/schema/types.go
++++ b/temporal/tools/common/schema/types.go
+@@ -85,6 +85,10 @@ const (
+ 	CLIOptUser = "user"
+ 	// CLIOptPassword is the cli option for password
+ 	CLIOptPassword = "password"
++	// CLIOptEnableEntraAuth is the cli option for enabling Entra ID authentication
++	CLIOptEnableEntraAuth = "enable-entra-auth"
++	// CLIOptEntraScope is the cli option for resource scope
++	CLIOptEntraScope = "entra-scope"
+ 	// CLIOptAuthenticator is the cli option for allowed authenticator settings
+ 	CLIOptAllowedAuthenticators = "allowed-authenticators"
+ 	// CLIOptTimeout is the cli option for timeout
+@@ -136,6 +140,10 @@ const (
+ 	CLIFlagUser = CLIOptUser + ", u"
+ 	// CLIFlagPassword is the cli flag for password
+ 	CLIFlagPassword = CLIOptPassword + ", pw"
++	// CLIFlagEnableEntraAuth is the cli flag for enabling Entra ID authentication
++	CLIFlagEnableEntraAuth = CLIOptEnableEntraAuth + ", ea"
++	// CLIFlagEntraScope is the cli flag for resource scope
++	CLIFlagEntraScope = CLIOptEntraScope + ", es"
+ 	// CLIFlagAllowedAuthenticators is the cli flag for allowed authenticators
+ 	CLIFlagAllowedAuthenticators = CLIOptAllowedAuthenticators + ", aa"
+ 	// CLIFlagTimeout is the cli flag for timeout
+diff --git a/temporal/tools/sql/handler.go b/temporal/tools/sql/handler.go
+index cb25e70..608df67 100644
+--- a/temporal/tools/sql/handler.go
++++ b/temporal/tools/sql/handler.go
+@@ -146,6 +146,8 @@ func parseConnectConfig(cli *cli.Context) (*config.SQL, error) {
+ 	cfg.ConnectAddr = fmt.Sprintf("%s:%v", host, port)
+ 	cfg.User = cli.GlobalString(schema.CLIOptUser)
+ 	cfg.Password = cli.GlobalString(schema.CLIOptPassword)
++	cfg.EnableEntraAuth = cli.GlobalBool(schema.CLIOptEnableEntraAuth)
++	cfg.EntraScope = cli.GlobalString(schema.CLIOptEntraScope)
+ 	cfg.DatabaseName = cli.GlobalString(schema.CLIOptDatabase)
+ 	cfg.PluginName = cli.GlobalString(schema.CLIOptPluginName)
+ 
+diff --git a/temporal/tools/sql/main.go b/temporal/tools/sql/main.go
+index 5f52a08..8a31508 100644
+--- a/temporal/tools/sql/main.go
++++ b/temporal/tools/sql/main.go
+@@ -58,7 +58,7 @@ func BuildCLIOptions() *cli.App {
+ 	app := cli.NewApp()
+ 	app.Name = "temporal-sql-tool"
+ 	app.Usage = "Command line tool for temporal sql operations"
+-	app.Version = "0.0.1"
++	app.Version = "0.0.2"
+ 
+ 	logger := log.NewCLILogger()
+ 
+@@ -87,6 +87,17 @@ func BuildCLIOptions() *cli.App {
+ 			Usage:  "password used for authentication when connecting to sql host",
+ 			EnvVar: "SQL_PASSWORD",
+ 		},
++		cli.BoolFlag{
++			Name:  schema.CLIFlagEnableEntraAuth,
++			Usage: "enable Entra ID authentication for SQL connection",
++			EnvVar: "SQL_ENABLE_ENTRA_AUTH",
++		},
++		cli.StringFlag{
++			Name:   schema.CLIFlagEntraScope,
++			Value:  "https://ossrdbms-aad.database.windows.net/.default",
++			Usage:  "resource scope for Entra ID authentication",
++			EnvVar: "SQL_ENTRA_SCOPE",
++		},
+ 		cli.StringFlag{
+ 			Name:   schema.CLIFlagDatabase,
+ 			Value:  "temporal",
+-- 
+2.43.0
+
