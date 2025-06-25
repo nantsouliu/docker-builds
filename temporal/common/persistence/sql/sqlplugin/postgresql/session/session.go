@@ -31,9 +31,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/iancoleman/strcase"
+	"github.com/jellydator/ttlcache/v3"
 	"github.com/jmoiron/sqlx"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
@@ -57,18 +59,29 @@ const (
 	sslCert = "sslcert"
 )
 
+var (
+	tokenCache = ttlcache.New(
+		ttlcache.WithTTL[string, azcore.AccessToken](time.Duration(60)*time.Minute),
+		ttlcache.WithDisableTouchOnHit[string, azcore.AccessToken](),
+	)
+)
+
 type Session struct {
 	*sqlx.DB
+}
+
+func init() {
+	// Initialize the token cache to expire tokens every 60 minutes.
+	go tokenCache.Start()
 }
 
 func NewSession(
 	cfg *config.SQL,
 	d driver.Driver,
 	resolver resolver.ServiceResolver,
-	cred *azidentity.DefaultAzureCredential,
 	logger log.Logger,
 ) (*Session, error) {
-	db, err := createConnection(cfg, d, resolver, cred, logger)
+	db, err := createConnection(cfg, d, resolver, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -85,10 +98,9 @@ func createConnection(
 	cfg *config.SQL,
 	d driver.Driver,
 	resolver resolver.ServiceResolver,
-	cred *azidentity.DefaultAzureCredential,
 	logger log.Logger,
 ) (*sqlx.DB, error) {
-	dsn, err := buildDSN(cfg, resolver, cred, logger)
+	dsn, err := buildDSN(cfg, resolver, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +126,6 @@ func createConnection(
 func buildDSN(
 	cfg *config.SQL,
 	r resolver.ServiceResolver,
-	cred *azidentity.DefaultAzureCredential,
 	logger log.Logger,
 ) (string, error) {
 	tlsAttrs := buildDSNAttr(cfg).Encode()
@@ -123,19 +134,31 @@ func buildDSN(
 	var passwd string
 	var err error = nil
 
-	if !cfg.EnableEntraAuth || cred == nil {
+	if !cfg.EnableEntraAuth {
 		passwd = url.QueryEscape(cfg.Password)
 	} else {
-		token, err := getAccessTokenWithRetry(
-			cred,
-			cfg.EntraScope,
-			3,
-			logger,
-		)
-		if err != nil {
-			logger.Error(fmt.Sprintf("failed to get access token for %v: %v", cfg.ConnectAddr, err), tag.Error(err))
+		var token azcore.AccessToken
+		if tokenCache.Has(cfg.User) {
+			item := tokenCache.Get(cfg.User)
+			token = item.Value()
+
+			if token.ExpiresOn.Before(item.ExpiresAt()) {
+				tokenCache.Delete(cfg.User)
+				token = azcore.AccessToken{}
+			}
 		}
-		passwd = token
+
+		if token.Token == "" {
+			token, err = getAccessTokenWithRetry(cfg.EntraScope, 3, logger)
+			if err != nil {
+				logger.Error(fmt.Sprintf("failed to get access token for %v: %v", cfg.ConnectAddr, err), tag.Error(err))
+				return "", err
+			}
+			// Cache the token
+			tokenCache.Set(cfg.User, token, ttlcache.DefaultTTL)
+		}
+
+		passwd = token.Token
 	}
 
 	dsn := fmt.Sprintf(
@@ -185,11 +208,16 @@ func buildDSNAttr(cfg *config.SQL) url.Values {
 	return parameters
 }
 
-func getAccessTokenWithRetry(cred *azidentity.DefaultAzureCredential, scope string, maxRetry int, logger log.Logger) (string, error) {
+func getAccessTokenWithRetry(scope string, maxRetry int, logger log.Logger) (azcore.AccessToken, error) {
 	if maxRetry <= 0 {
 		maxRetry = 1
 	}
 
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		logger.Error("Failed to create default Azure credential", tag.Error(err))
+		return azcore.AccessToken{}, err
+	}
 	ctx, ctxCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer ctxCancel()
 
@@ -199,11 +227,11 @@ func getAccessTokenWithRetry(cred *azidentity.DefaultAzureCredential, scope stri
 		token, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: scopeArray})
 		if err == nil {
 			logger.Info(fmt.Sprintf("fetched the access token. token ExpiresOn: %v", token.ExpiresOn))
-			return token.Token, nil
+			return token, nil
 		}
 		logger.Error(fmt.Sprintf("failed to get access token for scope %v: %v", scope, err), tag.Error(err))
 	}
 
 	logger.Error(fmt.Sprintf("failed to get access token for scope %v after %v attempts", scope, maxRetry))
-	return "", fmt.Errorf("failed to get access token for scope %v after %v attempts", scope, maxRetry)
+	return azcore.AccessToken{}, fmt.Errorf("failed to get access token for scope %v after %v attempts", scope, maxRetry)
 }

@@ -28,13 +28,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/jmoiron/sqlx"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
-	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence/sql"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
@@ -58,14 +56,13 @@ var (
 
 type plugin struct {
 	d driver.Driver
-	c *azidentity.DefaultAzureCredential
 }
 
 var _ sqlplugin.Plugin = (*plugin)(nil)
 
 func init() {
-	sql.RegisterPlugin(PluginName, &plugin{&driver.PQDriver{}, nil})
-	sql.RegisterPlugin(PluginNamePGX, &plugin{&driver.PGXDriver{}, nil})
+	sql.RegisterPlugin(PluginName, &plugin{&driver.PQDriver{}})
+	sql.RegisterPlugin(PluginNamePGX, &plugin{&driver.PGXDriver{}})
 
 }
 
@@ -118,18 +115,8 @@ func (d *plugin) createDBConnection(
 	resolver resolver.ServiceResolver,
 	logger log.Logger,
 ) (*sqlx.DB, error) {
-
-	if cfg.EnableEntraAuth && d.c == nil {
-		cred, err := azidentity.NewDefaultAzureCredential(nil)
-		if err != nil {
-			logger.Error("Failed to create default Azure credential", tag.Error(err))
-			return nil, err
-		}
-		d.c = cred
-	}
-
 	if cfg.DatabaseName != "" {
-		postgresqlSession, err := session.NewSession(cfg, d.d, resolver, d.c, logger)
+		postgresqlSession, err := session.NewSession(cfg, d.d, resolver, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -147,7 +134,6 @@ func (d *plugin) createDBConnection(
 			cfg,
 			d.d,
 			resolver,
-			d.c,
 			logger,
 		); err == nil {
 			return postgresqlSession.DB, nil
