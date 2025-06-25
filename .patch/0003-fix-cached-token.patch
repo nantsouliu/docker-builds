@@ -1,0 +1,265 @@
+From 94aa610630a1d76fd72b61f21204627eafc204be Mon Sep 17 00:00:00 2001
+From: Joey Liu <nantsouliu@microsoft.com>
+Date: Wed, 25 Jun 2025 08:54:54 +0000
+Subject: [PATCH] add ttl cache and create new credential to get token
+
+---
+ .../sql/sqlplugin/postgresql/plugin.go        | 20 +-----
+ .../sqlplugin/postgresql/session/session.go   | 64 +++++++++++++------
+ temporal/go.mod                               |  3 +-
+ temporal/go.sum                               |  6 +-
+ 4 files changed, 55 insertions(+), 38 deletions(-)
+
+diff --git a/temporal/common/persistence/sql/sqlplugin/postgresql/plugin.go b/temporal/common/persistence/sql/sqlplugin/postgresql/plugin.go
+index b62866e..b6a43ba 100644
+--- a/temporal/common/persistence/sql/sqlplugin/postgresql/plugin.go
++++ b/temporal/common/persistence/sql/sqlplugin/postgresql/plugin.go
+@@ -28,13 +28,11 @@ import (
+ 	"fmt"
+ 	"strings"
+ 
+-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+ 	"github.com/jmoiron/sqlx"
+ 	"go.temporal.io/api/serviceerror"
+ 	"go.temporal.io/server/common/clock"
+ 	"go.temporal.io/server/common/config"
+ 	"go.temporal.io/server/common/log"
+-	"go.temporal.io/server/common/log/tag"
+ 	"go.temporal.io/server/common/metrics"
+ 	"go.temporal.io/server/common/persistence/sql"
+ 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
+@@ -58,14 +56,13 @@ var (
+ 
+ type plugin struct {
+ 	d driver.Driver
+-	c *azidentity.DefaultAzureCredential
+ }
+ 
+ var _ sqlplugin.Plugin = (*plugin)(nil)
+ 
+ func init() {
+-	sql.RegisterPlugin(PluginName, &plugin{&driver.PQDriver{}, nil})
+-	sql.RegisterPlugin(PluginNamePGX, &plugin{&driver.PGXDriver{}, nil})
++	sql.RegisterPlugin(PluginName, &plugin{&driver.PQDriver{}})
++	sql.RegisterPlugin(PluginNamePGX, &plugin{&driver.PGXDriver{}})
+ 
+ }
+ 
+@@ -118,18 +115,8 @@ func (d *plugin) createDBConnection(
+ 	resolver resolver.ServiceResolver,
+ 	logger log.Logger,
+ ) (*sqlx.DB, error) {
+-
+-	if cfg.EnableEntraAuth && d.c == nil {
+-		cred, err := azidentity.NewDefaultAzureCredential(nil)
+-		if err != nil {
+-			logger.Error("Failed to create default Azure credential", tag.Error(err))
+-			return nil, err
+-		}
+-		d.c = cred
+-	}
+-
+ 	if cfg.DatabaseName != "" {
+-		postgresqlSession, err := session.NewSession(cfg, d.d, resolver, d.c, logger)
++		postgresqlSession, err := session.NewSession(cfg, d.d, resolver, logger)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -147,7 +134,6 @@ func (d *plugin) createDBConnection(
+ 			cfg,
+ 			d.d,
+ 			resolver,
+-			d.c,
+ 			logger,
+ 		); err == nil {
+ 			return postgresqlSession.DB, nil
+diff --git a/temporal/common/persistence/sql/sqlplugin/postgresql/session/session.go b/temporal/common/persistence/sql/sqlplugin/postgresql/session/session.go
+index 6c8dad0..d752080 100644
+--- a/temporal/common/persistence/sql/sqlplugin/postgresql/session/session.go
++++ b/temporal/common/persistence/sql/sqlplugin/postgresql/session/session.go
+@@ -31,9 +31,11 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+ 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+ 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+ 	"github.com/iancoleman/strcase"
++	"github.com/jellydator/ttlcache/v3"
+ 	"github.com/jmoiron/sqlx"
+ 	"go.temporal.io/server/common/config"
+ 	"go.temporal.io/server/common/log"
+@@ -57,18 +59,29 @@ const (
+ 	sslCert = "sslcert"
+ )
+ 
++var (
++	tokenCache = ttlcache.New(
++		ttlcache.WithTTL[string, azcore.AccessToken](time.Duration(60)*time.Minute),
++		ttlcache.WithDisableTouchOnHit[string, azcore.AccessToken](),
++	)
++)
++
+ type Session struct {
+ 	*sqlx.DB
+ }
+ 
++func init() {
++	// Initialize the token cache to expire tokens every 60 minutes.
++	go tokenCache.Start()
++}
++
+ func NewSession(
+ 	cfg *config.SQL,
+ 	d driver.Driver,
+ 	resolver resolver.ServiceResolver,
+-	cred *azidentity.DefaultAzureCredential,
+ 	logger log.Logger,
+ ) (*Session, error) {
+-	db, err := createConnection(cfg, d, resolver, cred, logger)
++	db, err := createConnection(cfg, d, resolver, logger)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -85,10 +98,9 @@ func createConnection(
+ 	cfg *config.SQL,
+ 	d driver.Driver,
+ 	resolver resolver.ServiceResolver,
+-	cred *azidentity.DefaultAzureCredential,
+ 	logger log.Logger,
+ ) (*sqlx.DB, error) {
+-	dsn, err := buildDSN(cfg, resolver, cred, logger)
++	dsn, err := buildDSN(cfg, resolver, logger)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -114,7 +126,6 @@ func createConnection(
+ func buildDSN(
+ 	cfg *config.SQL,
+ 	r resolver.ServiceResolver,
+-	cred *azidentity.DefaultAzureCredential,
+ 	logger log.Logger,
+ ) (string, error) {
+ 	tlsAttrs := buildDSNAttr(cfg).Encode()
+@@ -123,19 +134,31 @@ func buildDSN(
+ 	var passwd string
+ 	var err error = nil
+ 
+-	if !cfg.EnableEntraAuth || cred == nil {
++	if !cfg.EnableEntraAuth {
+ 		passwd = url.QueryEscape(cfg.Password)
+ 	} else {
+-		token, err := getAccessTokenWithRetry(
+-			cred,
+-			cfg.EntraScope,
+-			3,
+-			logger,
+-		)
+-		if err != nil {
+-			logger.Error(fmt.Sprintf("failed to get access token for %v: %v", cfg.ConnectAddr, err), tag.Error(err))
++		var token azcore.AccessToken
++		if tokenCache.Has(cfg.User) {
++			item := tokenCache.Get(cfg.User)
++			token = item.Value()
++
++			if token.ExpiresOn.Before(item.ExpiresAt()) {
++				tokenCache.Delete(cfg.User)
++				token = azcore.AccessToken{}
++			}
+ 		}
+-		passwd = token
++
++		if token.Token == "" {
++			token, err = getAccessTokenWithRetry(cfg.EntraScope, 3, logger)
++			if err != nil {
++				logger.Error(fmt.Sprintf("failed to get access token for %v: %v", cfg.ConnectAddr, err), tag.Error(err))
++				return "", err
++			}
++			// Cache the token
++			tokenCache.Set(cfg.User, token, ttlcache.DefaultTTL)
++		}
++
++		passwd = token.Token
+ 	}
+ 
+ 	dsn := fmt.Sprintf(
+@@ -185,11 +208,16 @@ func buildDSNAttr(cfg *config.SQL) url.Values {
+ 	return parameters
+ }
+ 
+-func getAccessTokenWithRetry(cred *azidentity.DefaultAzureCredential, scope string, maxRetry int, logger log.Logger) (string, error) {
++func getAccessTokenWithRetry(scope string, maxRetry int, logger log.Logger) (azcore.AccessToken, error) {
+ 	if maxRetry <= 0 {
+ 		maxRetry = 1
+ 	}
+ 
++	cred, err := azidentity.NewDefaultAzureCredential(nil)
++	if err != nil {
++		logger.Error("Failed to create default Azure credential", tag.Error(err))
++		return azcore.AccessToken{}, err
++	}
+ 	ctx, ctxCancel := context.WithTimeout(context.Background(), 5*time.Second)
+ 	defer ctxCancel()
+ 
+@@ -199,11 +227,11 @@ func getAccessTokenWithRetry(cred *azidentity.DefaultAzureCredential, scope stri
+ 		token, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: scopeArray})
+ 		if err == nil {
+ 			logger.Info(fmt.Sprintf("fetched the access token. token ExpiresOn: %v", token.ExpiresOn))
+-			return token.Token, nil
++			return token, nil
+ 		}
+ 		logger.Error(fmt.Sprintf("failed to get access token for scope %v: %v", scope, err), tag.Error(err))
+ 	}
+ 
+ 	logger.Error(fmt.Sprintf("failed to get access token for scope %v after %v attempts", scope, maxRetry))
+-	return "", fmt.Errorf("failed to get access token for scope %v after %v attempts", scope, maxRetry)
++	return azcore.AccessToken{}, fmt.Errorf("failed to get access token for scope %v after %v attempts", scope, maxRetry)
+ }
+diff --git a/temporal/go.mod b/temporal/go.mod
+index ddfe682..38f4436 100644
+--- a/temporal/go.mod
++++ b/temporal/go.mod
+@@ -69,7 +69,7 @@ require (
+ 	go.uber.org/zap v1.27.0
+ 	golang.org/x/exp v0.0.0-20250305212735-054e65f0b394
+ 	golang.org/x/oauth2 v0.28.0
+-	golang.org/x/sync v0.14.0
++	golang.org/x/sync v0.15.0
+ 	golang.org/x/text v0.25.0
+ 	golang.org/x/time v0.11.0
+ 	google.golang.org/api v0.228.0
+@@ -126,6 +126,7 @@ require (
+ 	github.com/jackc/pgpassfile v1.0.0 // indirect
+ 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+ 	github.com/jackc/puddle/v2 v2.2.2 // indirect
++	github.com/jellydator/ttlcache/v3 v3.4.0 // indirect
+ 	github.com/jmespath/go-jmespath v0.4.0 // indirect
+ 	github.com/josharian/intern v1.0.0 // indirect
+ 	github.com/klauspost/compress v1.18.0 // indirect
+diff --git a/temporal/go.sum b/temporal/go.sum
+index f5989f4..80d4e38 100644
+--- a/temporal/go.sum
++++ b/temporal/go.sum
+@@ -196,6 +196,8 @@ github.com/jackc/pgx/v5 v5.7.4 h1:9wKznZrhWa2QiHL+NjTSPP6yjl3451BX3imWDnokYlg=
+ github.com/jackc/pgx/v5 v5.7.4/go.mod h1:ncY89UGWxg82EykZUwSpUKEfccBGGYq1xjrOpsbsfGQ=
+ github.com/jackc/puddle/v2 v2.2.2 h1:PR8nw+E/1w0GLuRFSmiioY6UooMp6KJv0/61nB7icHo=
+ github.com/jackc/puddle/v2 v2.2.2/go.mod h1:vriiEXHvEE654aYKXXjOvZM39qJ0q+azkZFrfEOc3H4=
++github.com/jellydator/ttlcache/v3 v3.4.0 h1:YS4P125qQS0tNhtL6aeYkheEaB/m8HCqdMMP4mnWdTY=
++github.com/jellydator/ttlcache/v3 v3.4.0/go.mod h1:Hw9EgjymziQD3yGsQdf1FqFdpp7YjFMd4Srg5EJlgD4=
+ github.com/jessevdk/go-flags v1.4.0/go.mod h1:4FA24M0QyGHXBuZZK/XkWh8h0e1EYbRYJSGM75WSRxI=
+ github.com/jessevdk/go-flags v1.5.0/go.mod h1:Fw0T6WPc1dYxT4mKEZRfG5kJhaTDP9pj1c2EWnYs/m4=
+ github.com/jmespath/go-jmespath v0.4.0 h1:BEgLn5cpjn8UN1mAw4NjwDrS35OdebyEtFe+9YPoQUg=
+@@ -477,8 +479,8 @@ golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9/go.mod h1:RxMgew5VJxzue5/jJ
+ golang.org/x/sync v0.0.0-20210220032951-036812b2e83c/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.1.0/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+-golang.org/x/sync v0.14.0 h1:woo0S4Yywslg6hp4eUFjTVOyKt0RookbpAHG4c1HmhQ=
+-golang.org/x/sync v0.14.0/go.mod h1:1dzgHSNfp02xaA81J2MS99Qcpr2w7fw1gpm99rleRqA=
++golang.org/x/sync v0.15.0 h1:KWH3jNZsfyT6xfAfKiz6MRNmd46ByHDYaZ7KSkCtdW8=
++golang.org/x/sync v0.15.0/go.mod h1:1dzgHSNfp02xaA81J2MS99Qcpr2w7fw1gpm99rleRqA=
+ golang.org/x/sys v0.0.0-20180830151530-49385e6e1522/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
+ golang.org/x/sys v0.0.0-20190215142949-d0b11bdaac8a/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
+ golang.org/x/sys v0.0.0-20190312061237-fead79001313/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+-- 
+2.43.0
+
