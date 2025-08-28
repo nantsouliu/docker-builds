@@ -206,6 +206,7 @@ setup_postgres_schema() {
     SCHEMA_DIR=${TEMPORAL_HOME}/schema/postgresql/${POSTGRES_VERSION_DIR}/temporal/versioned
     # Create database only if its name is different from the user name. Otherwise PostgreSQL container itself will create database.
     if [[ ${DBNAME} != "${POSTGRES_USER}" && ${SKIP_DB_CREATE} != true ]]; then
+        echo "Creating database ${DBNAME}."
         temporal-sql-tool \
             --plugin ${DB} \
             --ep "${POSTGRES_SEEDS}" \
@@ -220,6 +221,7 @@ setup_postgres_schema() {
             --tls-server-name "${POSTGRES_TLS_SERVER_NAME}" \
             create
     fi
+    echo "Setting up schema for ${DBNAME}."
     temporal-sql-tool \
         --plugin ${DB} \
         --ep "${POSTGRES_SEEDS}" \
@@ -233,6 +235,7 @@ setup_postgres_schema() {
         --tls-ca-file "${POSTGRES_TLS_CA_FILE}" \
         --tls-server-name "${POSTGRES_TLS_SERVER_NAME}" \
         setup-schema -v 0.0
+    echo "Updating schema for ${DBNAME}."
     temporal-sql-tool \
         --plugin ${DB} \
         --ep "${POSTGRES_SEEDS}" \
@@ -251,6 +254,7 @@ setup_postgres_schema() {
     if [[ ${ENABLE_ES} == false ]]; then
       VISIBILITY_SCHEMA_DIR=${TEMPORAL_HOME}/schema/postgresql/${POSTGRES_VERSION_DIR}/visibility/versioned
       if [[ ${VISIBILITY_DBNAME} != "${POSTGRES_USER}" && ${SKIP_DB_CREATE} != true ]]; then
+          echo "Creating visibility database ${VISIBILITY_DBNAME}."
           temporal-sql-tool \
               --plugin ${DB} \
               --ep "${POSTGRES_SEEDS}" \
@@ -265,6 +269,7 @@ setup_postgres_schema() {
               --tls-server-name "${POSTGRES_TLS_SERVER_NAME}" \
               create
       fi
+      echo "Setting up schema for ${VISIBILITY_DBNAME}."
       temporal-sql-tool \
           --plugin ${DB} \
           --ep "${POSTGRES_SEEDS}" \
@@ -278,6 +283,7 @@ setup_postgres_schema() {
           --tls-ca-file "${POSTGRES_TLS_CA_FILE}" \
           --tls-server-name "${POSTGRES_TLS_SERVER_NAME}" \
           setup-schema -v 0.0
+      echo "Updating schema for ${VISIBILITY_DBNAME}."
       temporal-sql-tool \
           --plugin ${DB} \
           --ep "${POSTGRES_SEEDS}" \
@@ -429,5 +435,17 @@ if [[ ${ENABLE_ES} == true ]]; then
     setup_es_index
 fi
 
-# Run this func in parallel process. It will wait for server to start and then run required steps.
-setup_server &
+if [[ ${WAIT_FOR_SETUP_SERVER} == true ]]; then
+    # If running as k8s job, wait for setup_server to complete.
+    echo "Starting setup_server, will wait for complete."
+    setup_server
+    echo "Setup_server completed."
+    echo "Terminating istio proxy."
+    curl -s -XPOST http://localhost:15020/quitquitquit
+    sleep 10
+else
+    # Run this func in parallel process. It will wait for server to start and then run required steps.
+    echo "Running setup_server in parallel."
+    setup_server &
+fi
+echo "Exiting auto-setup"
