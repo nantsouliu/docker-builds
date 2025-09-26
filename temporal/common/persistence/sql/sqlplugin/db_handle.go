@@ -46,7 +46,7 @@ import (
 const (
 	// TODO: this should be dynamic config.
 	sessionRefreshMinInternal = 1 * time.Second
-	accessTokenExpireErrorMsg = "The access token has expired. Please acquire a new token and retry."
+	accessTokenExpireErrorMsg = "The access token has expired"
 )
 
 var (
