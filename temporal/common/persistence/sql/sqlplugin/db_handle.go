@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -45,6 +46,7 @@ import (
 const (
 	// TODO: this should be dynamic config.
 	sessionRefreshMinInternal = 1 * time.Second
+	accessTokenExpireErrorMsg = "The access token has expired"
 )
 
 var (
@@ -177,7 +179,8 @@ func (h *DatabaseHandle) ConvertError(err error) error {
 		errors.Is(err, io.EOF) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.ECONNABORTED) ||
-		errors.Is(err, syscall.ECONNREFUSED) {
+		errors.Is(err, syscall.ECONNREFUSED) || 
+		(err != nil && strings.Contains(err.Error(), accessTokenExpireErrorMsg)) {
 		h.reconnect(true)
 		return serviceerror.NewUnavailable(fmt.Sprintf("database connection lost: %s", err.Error()))
 	}
