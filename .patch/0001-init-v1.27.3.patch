@@ -1,0 +1,808 @@
+From 4db4e87905e6eef1b7807d54ff9db59716d2c696 Mon Sep 17 00:00:00 2001
+From: Joey Liu <nantsouliu@microsoft.com>
+Date: Thu, 18 Dec 2025 23:46:30 +0000
+Subject: [PATCH] upgrade to v1.27.3 and refactoring
+
+---
+ temporal/azureml/azureauth/credentials.go     |  81 ++++++++
+ temporal/common/config/config.go              |   4 +
+ .../persistence/sql/sqlplugin/db_handle.go    |  17 +-
+ .../sql/sqlplugin/db_handle_utils.go          | 177 ++++++++++++++++++
+ .../sql/sqlplugin/postgresql/db.go            |  34 ++--
+ .../sql/sqlplugin/postgresql/plugin.go        |   2 +-
+ .../sqlplugin/postgresql/session/session.go   |   4 +-
+ .../postgresql/session/session_utils.go       |  42 +++++
+ temporal/docker/config_template.yaml          |   6 +-
+ temporal/go.mod                               |  17 +-
+ temporal/go.sum                               |  43 ++++-
+ temporal/tools/common/schema/types.go         |   8 +
+ temporal/tools/sql/handler.go                 |   2 +
+ temporal/tools/sql/main.go                    |  15 +-
+ 14 files changed, 407 insertions(+), 45 deletions(-)
+ create mode 100644 temporal/azureml/azureauth/credentials.go
+ create mode 100644 temporal/common/persistence/sql/sqlplugin/db_handle_utils.go
+ create mode 100644 temporal/common/persistence/sql/sqlplugin/postgresql/session/session_utils.go
+
+diff --git a/temporal/azureml/azureauth/credentials.go b/temporal/azureml/azureauth/credentials.go
+new file mode 100644
+index 0000000..b9ff61a
+--- /dev/null
++++ b/temporal/azureml/azureauth/credentials.go
+@@ -0,0 +1,81 @@
++// The MIT License
++//
++// Copyright (c) 2025 Microsoft Corporation. All rights reserved.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++// THE SOFTWARE.
++
++package azureauth
++
++import (
++	"context"
++	"log/slog"
++	"os"
++	"time"
++
++	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
++	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
++	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
++)
++
++var (
++	credential  azcore.TokenCredential
++	initCredErr error
++	logger      *slog.Logger
++)
++
++func init() {
++	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
++		Level:     slog.LevelInfo,
++		AddSource: true,
++	}))
++
++	credential, initCredErr = azidentity.NewWorkloadIdentityCredential(nil)
++	if initCredErr == nil {
++		logger.Info("initialized WorkloadIdentityCredential successfully")
++	} else {
++		logger.Info("falling back to DefaultAzureCredential")
++		credential, initCredErr = azidentity.NewDefaultAzureCredential(nil)
++		if initCredErr == nil {
++			logger.Info("initialized DefaultAzureCredential successfully")
++		}
++	}
++
++	if initCredErr != nil {
++		logger.Error("Failed to initialize Azure credential", "error", initCredErr)
++	}
++}
++
++func GetAccessToken(scope string) (string, error) {
++	if initCredErr != nil {
++		logger.Error("azure credential is not initialized", "error", initCredErr)
++		return "", initCredErr
++	}
++
++	ctx, ctxCancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer ctxCancel()
++
++	token, err := credential.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{scope}})
++	if err == nil {
++		logger.Info("got the access token successfully", "scope", scope, "expires_on", token.ExpiresOn)
++		return token.Token, nil
++	}
++
++	logger.Error("failed to get access token", "scope", scope, "error", err)
++	return "", err
++}
+diff --git a/temporal/common/config/config.go b/temporal/common/config/config.go
+index 9f3d8b5..c1b0486 100644
+--- a/temporal/common/config/config.go
++++ b/temporal/common/config/config.go
+@@ -391,6 +391,10 @@ type (
+ 		User string `yaml:"user"`
+ 		// Password is the password corresponding to the user name
+ 		Password string `yaml:"password"`
++		// msft: EnableEntraAuth is true if the SQL plugin uses Entra ID authentication Password is ignored in this case
++		EnableEntraAuth bool `yaml:"enableEntraAuth"`
++		// msft: EntraScope is the scope to get the access token
++		EntraScope string `yaml:"entraScope"`
+ 		// PluginName is the name of SQL plugin
+ 		PluginName string `yaml:"pluginName" validate:"nonzero"`
+ 		// DatabaseName is the name of SQL database to connect to
+diff --git a/temporal/common/persistence/sql/sqlplugin/db_handle.go b/temporal/common/persistence/sql/sqlplugin/db_handle.go
+index a4f4071..c80f850 100644
+--- a/temporal/common/persistence/sql/sqlplugin/db_handle.go
++++ b/temporal/common/persistence/sql/sqlplugin/db_handle.go
+@@ -63,6 +63,9 @@ type DatabaseHandle struct {
+ 	timeSource  clock.TimeSource
+ 	// Ensures only one refresh call happens at a time
+ 	sync.Mutex
++
++	// msft: For background heartbeat
++	cancel context.CancelFunc
+ }
+ 
+ // An invalid connection returns `DatabaseUnavailableError` for all operations
+@@ -75,6 +78,7 @@ func NewDatabaseHandle(
+ 	metricsHandler metrics.Handler,
+ 	timeSource clock.TimeSource,
+ ) *DatabaseHandle {
++	ctx, cancel := context.WithCancel(context.Background()) // msft
+ 	handle := &DatabaseHandle{
+ 		running:      true,
+ 		connect:      connect,
+@@ -82,8 +86,10 @@ func NewDatabaseHandle(
+ 		metrics:      metricsHandler,
+ 		logger:       logger,
+ 		timeSource:   timeSource,
++		cancel:       cancel, // msft
+ 	}
+ 	handle.reconnect(true)
++	go handle.heartbeat(ctx) // msft
+ 	return handle
+ }
+ 
+@@ -141,6 +147,7 @@ func (h *DatabaseHandle) Close() {
+ 
+ 	if h.running {
+ 		h.running = false
++		h.cancel()
+ 		db := h.db.Swap(nil)
+ 		if db != nil {
+ 			db.Close()
+@@ -160,18 +167,12 @@ func (h *DatabaseHandle) DB() (*sqlx.DB, error) {
+ }
+ 
+ func (h *DatabaseHandle) Conn() Conn {
+-	if db := h.db.Load(); db != nil {
+-		return db
+-	}
+-
+-	if db := h.reconnect(false); db != nil {
+-		return db
+-	}
+-	return invalidConn{}
++	return &tokenAuthConn{h: h}
+ }
+ 
+ func (h *DatabaseHandle) ConvertError(err error) error {
+ 	if h.needsRefresh(err) ||
++		IsAccessTokenExpiredError(err) || // msft
+ 		errors.Is(err, driver.ErrBadConn) ||
+ 		errors.Is(err, io.ErrUnexpectedEOF) ||
+ 		errors.Is(err, io.EOF) ||
+diff --git a/temporal/common/persistence/sql/sqlplugin/db_handle_utils.go b/temporal/common/persistence/sql/sqlplugin/db_handle_utils.go
+new file mode 100644
+index 0000000..040cbea
+--- /dev/null
++++ b/temporal/common/persistence/sql/sqlplugin/db_handle_utils.go
+@@ -0,0 +1,177 @@
++// The MIT License
++//
++// Copyright (c) 2025 Microsoft Corporation. All rights reserved.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++// THE SOFTWARE.
++
++package sqlplugin
++
++import (
++	"context"
++	"database/sql"
++	"log/slog"
++	"os"
++	"strings"
++	"time"
++
++	"github.com/jmoiron/sqlx"
++)
++
++const (
++	accessTokenExpiredErrorMsg = "The access token has expired"
++	defaultHeartbeatInterval   = 60 * time.Second
++)
++
++var (
++	heartbeatInterval = defaultHeartbeatInterval
++	logger            *slog.Logger
++)
++
++func init() {
++	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
++		Level:     slog.LevelInfo,
++		AddSource: true,
++	}))
++
++	// AZUREML_TEMPORAL_DB_HEARTBEAT_INTERVAL should be a duration string, e.g. "60s", "1m".
++	if val := os.Getenv("AZUREML_TEMPORAL_DB_HEARTBEAT_INTERVAL"); val != "" {
++		if d, err := time.ParseDuration(val); err == nil && d > 0 {
++			heartbeatInterval = d
++			logger.Info("setting heartbeat interval from env", "interval_seconds", d.Seconds())
++		} else {
++			logger.Warn("invalid AZUREML_TEMPORAL_DB_HEARTBEAT_INTERVAL, using default", "value", val, "error", err)
++		}
++	}
++	logger.Info("heartbeat interval", "interval_seconds", heartbeatInterval.Seconds())
++}
++
++func IsAccessTokenExpiredError(err error) bool {
++	return err != nil && strings.Contains(err.Error(), accessTokenExpiredErrorMsg)
++}
++
++// utilis for DatabaseHandle start
++func (h *DatabaseHandle) WithRetry(fn func(*sqlx.DB) error) error {
++	db, err := h.DB()
++	if err != nil {
++		return err
++	}
++
++	err = fn(db)
++	if IsAccessTokenExpiredError(err) {
++		logger.Warn("access token expired, reconnecting and retrying", "error", err)
++		h.reconnect(true)
++		db, err = h.DB()
++		if err != nil {
++			return err
++		}
++		err = fn(db)
++	}
++	return err
++}
++
++func (h *DatabaseHandle) heartbeat(ctx context.Context) {
++	ticker := time.NewTicker(heartbeatInterval)
++	defer ticker.Stop()
++
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++			h.checkConnection(ctx)
++		}
++	}
++}
++
++func (h *DatabaseHandle) checkConnection(ctx context.Context) {
++	db := h.db.Load()
++	if db == nil {
++		return
++	}
++
++	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
++	defer cancel()
++
++	err := db.PingContext(pingCtx)
++
++	if err != nil {
++		if IsAccessTokenExpiredError(err) {
++			logger.Warn("heartbeat detected expired token, reconnecting", "error", err)
++			h.reconnect(true)
++		} else {
++			logger.Warn("heartbeat ping failed", "error", err)
++		}
++	}
++}
++
++// utilis for DatabaseHandle end
++
++type tokenAuthConn struct {
++	h *DatabaseHandle
++}
++
++func (c *tokenAuthConn) Rebind(query string) string {
++	db, err := c.h.DB()
++	if err != nil {
++		return query
++	}
++	return db.Rebind(query)
++}
++
++func (c *tokenAuthConn) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
++	var res sql.Result
++	err := c.h.WithRetry(func(db *sqlx.DB) error {
++		var err error
++		res, err = db.ExecContext(ctx, query, args...)
++		return err
++	})
++	return res, err
++}
++
++func (c *tokenAuthConn) NamedExecContext(ctx context.Context, query string, arg interface{}) (sql.Result, error) {
++	var res sql.Result
++	err := c.h.WithRetry(func(db *sqlx.DB) error {
++		var err error
++		res, err = db.NamedExecContext(ctx, query, arg)
++		return err
++	})
++	return res, err
++}
++
++func (c *tokenAuthConn) GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
++	return c.h.WithRetry(func(db *sqlx.DB) error {
++		return db.GetContext(ctx, dest, query, args...)
++	})
++}
++
++func (c *tokenAuthConn) SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
++	return c.h.WithRetry(func(db *sqlx.DB) error {
++		return db.SelectContext(ctx, dest, query, args...)
++	})
++}
++
++func (c *tokenAuthConn) PrepareNamedContext(ctx context.Context, query string) (*sqlx.NamedStmt, error) {
++	var stmt *sqlx.NamedStmt
++	err := c.h.WithRetry(func(db *sqlx.DB) error {
++		var err error
++		stmt, err = db.PrepareNamedContext(ctx, query)
++		return err
++	})
++	return stmt, err
++}
+diff --git a/temporal/common/persistence/sql/sqlplugin/postgresql/db.go b/temporal/common/persistence/sql/sqlplugin/postgresql/db.go
+index 2b627ba..b8aafea 100644
+--- a/temporal/common/persistence/sql/sqlplugin/postgresql/db.go
++++ b/temporal/common/persistence/sql/sqlplugin/postgresql/db.go
+@@ -92,12 +92,13 @@ func (pdb *db) conn() sqlplugin.Conn {
+ 
+ // BeginTx starts a new transaction and returns a reference to the Tx object
+ func (pdb *db) BeginTx(ctx context.Context) (sqlplugin.Tx, error) {
+-	db, err := pdb.handle.DB()
+-	if err != nil {
+-		// This error needs no conversion
+-		return nil, err
+-	}
+-	tx, err := db.BeginTxx(ctx, nil)
++	// msft: improve retry logic for access token expiry error
++	var tx *sqlx.Tx
++	err := pdb.handle.WithRetry(func(db *sqlx.DB) error {
++		var err error
++		tx, err = db.BeginTxx(ctx, nil)
++		return err
++	})
+ 	if err != nil {
+ 		return nil, pdb.handle.ConvertError(err)
+ 	}
+@@ -160,11 +161,10 @@ func (pdb *db) GetContext(ctx context.Context, dest any, query string, args ...a
+ }
+ 
+ func (pdb *db) Select(dest any, query string, args ...any) error {
+-	db, err := pdb.handle.DB()
+-	if err != nil {
+-		return err
+-	}
+-	err = db.Select(dest, query, args...)
++	// msft: improve retry logic for access token expiry error
++	err := pdb.handle.WithRetry(func(db *sqlx.DB) error {
++		return db.Select(dest, query, args...)
++	})
+ 	return pdb.handle.ConvertError(err)
+ }
+ 
+@@ -184,11 +184,13 @@ func (pdb *db) PrepareNamedContext(ctx context.Context, query string) (*sqlx.Nam
+ }
+ 
+ func (pdb *db) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+-	db, err := pdb.handle.DB()
+-	if err != nil {
+-		return nil, err
+-	}
+-	rows, err := db.QueryContext(ctx, query, args...)
++	// msft: improve retry logic for access token expiry error
++	var rows *sql.Rows
++	err := pdb.handle.WithRetry(func(db *sqlx.DB) error {
++		var err error
++		rows, err = db.QueryContext(ctx, query, args...)
++		return err
++	})
+ 	return rows, pdb.handle.ConvertError(err)
+ }
+ 
+diff --git a/temporal/common/persistence/sql/sqlplugin/postgresql/plugin.go b/temporal/common/persistence/sql/sqlplugin/postgresql/plugin.go
+index 8ea7f00..1a02d04 100644
+--- a/temporal/common/persistence/sql/sqlplugin/postgresql/plugin.go
++++ b/temporal/common/persistence/sql/sqlplugin/postgresql/plugin.go
+@@ -142,4 +142,4 @@ func (d *plugin) createDBConnection(
+ 	return nil, serviceerror.NewUnavailable(
+ 		fmt.Sprintf("unable to connect to DB, tried default DB names: %v, errors: %v", strings.Join(defaultDatabaseNames, ","), errors),
+ 	)
+-}
++}
+\ No newline at end of file
+diff --git a/temporal/common/persistence/sql/sqlplugin/postgresql/session/session.go b/temporal/common/persistence/sql/sqlplugin/postgresql/session/session.go
+index 4e70433..490baad 100644
+--- a/temporal/common/persistence/sql/sqlplugin/postgresql/session/session.go
++++ b/temporal/common/persistence/sql/sqlplugin/postgresql/session/session.go
+@@ -106,7 +106,7 @@ func buildDSN(
+ 	dsn := fmt.Sprintf(
+ 		dsnFmt,
+ 		cfg.User,
+-		url.QueryEscape(cfg.Password),
++		getPassword(cfg), // msft
+ 		resolvedAddr,
+ 		cfg.DatabaseName,
+ 		tlsAttrs,
+@@ -147,4 +147,4 @@ func buildDSNAttr(cfg *config.SQL) url.Values {
+ 		parameters.Set(key, value)
+ 	}
+ 	return parameters
+-}
++}
+\ No newline at end of file
+diff --git a/temporal/common/persistence/sql/sqlplugin/postgresql/session/session_utils.go b/temporal/common/persistence/sql/sqlplugin/postgresql/session/session_utils.go
+new file mode 100644
+index 0000000..11950ba
+--- /dev/null
++++ b/temporal/common/persistence/sql/sqlplugin/postgresql/session/session_utils.go
+@@ -0,0 +1,42 @@
++// The MIT License
++//
++// Copyright (c) 2025 Microsoft Corporation. All rights reserved.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++// THE SOFTWARE.
++
++package session
++
++import (
++	"net/url"
++
++	"go.temporal.io/server/azureml/azureauth"
++	"go.temporal.io/server/common/config"
++)
++
++func getPassword(cfg *config.SQL) (string) {
++	if !cfg.EnableEntraAuth {
++		return url.QueryEscape(cfg.Password)
++	} else {
++		token, err := azureauth.GetAccessToken(cfg.EntraScope)
++		if err != nil {
++			return ""
++		}
++		return token
++	}
++}
+\ No newline at end of file
+diff --git a/temporal/docker/config_template.yaml b/temporal/docker/config_template.yaml
+index a766453..c9bebac 100644
+--- a/temporal/docker/config_template.yaml
++++ b/temporal/docker/config_template.yaml
+@@ -107,6 +107,8 @@ persistence:
+                 connectProtocol: "tcp"
+                 user: "{{ default .Env.POSTGRES_USER "" }}"
+                 password: "{{ default .Env.POSTGRES_PWD "" }}"
++                enableEntraAuth: {{ default .Env.ENABLE_ENTRA_AUTH "false" }} # msft
++                entraScope: "{{ default .Env.ENTRA_SCOPE "https://ossrdbms-aad.database.windows.net/.default" }}" # msft
+                 maxConns: {{ default .Env.SQL_MAX_CONNS "20" }}
+                 maxIdleConns: {{ default .Env.SQL_MAX_IDLE_CONNS "20" }}
+                 maxConnLifetime: {{ default .Env.SQL_MAX_CONN_TIME "1h" }}
+@@ -133,8 +135,8 @@ persistence:
+                 connectProtocol: "tcp"
+                 user: "{{ $visibility_user }}"
+                 password: "{{ $visibility_pwd }}"
+-                maxConns: {{ default .Env.SQL_VIS_MAX_CONNS "10" }}
+-                maxIdleConns: {{ default .Env.SQL_VIS_MAX_IDLE_CONNS "10" }}
++                enableEntraAuth: {{ default .Env.ENABLE_ENTRA_AUTH "false" }} # msft
++                entraScope: "{{ default .Env.ENTRA_SCOPE "https://ossrdbms-aad.database.windows.net/.default" }}" # msft
+                 maxConnLifetime: {{ default .Env.SQL_VIS_MAX_CONN_TIME "1h" }}
+                 tls:
+                     enabled: {{ default .Env.SQL_TLS_ENABLED "false" }}
+diff --git a/temporal/go.mod b/temporal/go.mod
+index df12cda..ddfe682 100644
+--- a/temporal/go.mod
++++ b/temporal/go.mod
+@@ -9,6 +9,8 @@ retract (
+ 
+ require (
+ 	cloud.google.com/go/storage v1.51.0
++	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.0
++	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.10.0
+ 	github.com/aws/aws-sdk-go v1.55.6
+ 	github.com/blang/semver/v4 v4.0.0
+ 	github.com/cactus/go-statsd-client/v5 v5.1.0
+@@ -67,8 +69,8 @@ require (
+ 	go.uber.org/zap v1.27.0
+ 	golang.org/x/exp v0.0.0-20250305212735-054e65f0b394
+ 	golang.org/x/oauth2 v0.28.0
+-	golang.org/x/sync v0.12.0
+-	golang.org/x/text v0.23.0
++	golang.org/x/sync v0.14.0
++	golang.org/x/text v0.25.0
+ 	golang.org/x/time v0.11.0
+ 	google.golang.org/api v0.228.0
+ 	google.golang.org/grpc v1.71.0
+@@ -89,6 +91,8 @@ require (
+ 	cloud.google.com/go/iam v1.4.2 // indirect
+ 	cloud.google.com/go/monitoring v1.24.1 // indirect
+ 	filippo.io/edwards25519 v1.1.0 // indirect
++	github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.1 // indirect
++	github.com/AzureAD/microsoft-authentication-library-for-go v1.4.2 // indirect
+ 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.27.0 // indirect
+ 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.51.0 // indirect
+ 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.51.0 // indirect
+@@ -109,6 +113,7 @@ require (
+ 	github.com/go-logr/logr v1.4.2 // indirect
+ 	github.com/go-logr/stdr v1.2.2 // indirect
+ 	github.com/gogo/protobuf v1.3.2 // indirect
++	github.com/golang-jwt/jwt/v5 v5.2.2 // indirect
+ 	github.com/golang/mock v1.6.0 // indirect
+ 	github.com/golang/snappy v1.0.0 // indirect
+ 	github.com/google/pprof v0.0.0-20250317173921-a4b03ec1a45e // indirect
+@@ -124,6 +129,7 @@ require (
+ 	github.com/jmespath/go-jmespath v0.4.0 // indirect
+ 	github.com/josharian/intern v1.0.0 // indirect
+ 	github.com/klauspost/compress v1.18.0 // indirect
++	github.com/kylelemons/godebug v1.1.0 // indirect
+ 	github.com/mailru/easyjson v0.9.0 // indirect
+ 	github.com/mattn/go-colorable v0.1.14 // indirect
+ 	github.com/mattn/go-isatty v0.0.20 // indirect
+@@ -131,6 +137,7 @@ require (
+ 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+ 	github.com/ncruces/go-strftime v0.1.9 // indirect
+ 	github.com/opentracing/opentracing-go v1.2.0 // indirect
++	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
+ 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
+ 	github.com/pmezard/go-difflib v1.0.0 // indirect
+ 	github.com/prometheus/procfs v0.16.0 // indirect
+@@ -151,9 +158,9 @@ require (
+ 	go.opentelemetry.io/proto/otlp v1.5.0 // indirect
+ 	go.uber.org/atomic v1.11.0 // indirect
+ 	go.uber.org/dig v1.18.1 // indirect
+-	golang.org/x/crypto v0.36.0 // indirect
+-	golang.org/x/net v0.37.0 // indirect
+-	golang.org/x/sys v0.31.0 // indirect
++	golang.org/x/crypto v0.38.0 // indirect
++	golang.org/x/net v0.40.0 // indirect
++	golang.org/x/sys v0.33.0 // indirect
+ 	google.golang.org/genproto v0.0.0-20250324211829-b45e905df463 // indirect
+ 	google.golang.org/genproto/googleapis/api v0.0.0-20250324211829-b45e905df463 // indirect
+ 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250324211829-b45e905df463 // indirect
+diff --git a/temporal/go.sum b/temporal/go.sum
+index 603ea64..f5989f4 100644
+--- a/temporal/go.sum
++++ b/temporal/go.sum
+@@ -24,6 +24,18 @@ cloud.google.com/go/trace v1.11.3/go.mod h1:pt7zCYiDSQjC9Y2oqCsh9jF4GStB/hmjrYLs
+ dmitri.shuralyov.com/gpu/mtl v0.0.0-20190408044501-666a987793e9/go.mod h1:H6x//7gZCb22OMCxBHrMx7a5I7Hp++hsVxbQ4BYO7hU=
+ filippo.io/edwards25519 v1.1.0 h1:FNf4tywRC1HmFuKW5xopWpigGjJKiJSV0Cqo0cJWDaA=
+ filippo.io/edwards25519 v1.1.0/go.mod h1:BxyFTGdWcka3PhytdK4V28tE5sGfRvvvRV7EaN4VDT4=
++github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.0 h1:Gt0j3wceWMwPmiazCa8MzMA0MfhmPIz0Qp0FJ6qcM0U=
++github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.0/go.mod h1:Ot/6aikWnKWi4l9QB7qVSwa8iMphQNqkWALMoNT3rzM=
++github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.10.0 h1:j8BorDEigD8UFOSZQiSqAMOOleyQOOQPnUAwV+Ls1gA=
++github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.10.0/go.mod h1:JdM5psgjfBf5fo2uWOZhflPWyDBZ/O/CNAH9CtsuZE4=
++github.com/Azure/azure-sdk-for-go/sdk/azidentity/cache v0.3.2 h1:yz1bePFlP5Vws5+8ez6T3HWXPmwOK7Yvq8QxDBD3SKY=
++github.com/Azure/azure-sdk-for-go/sdk/azidentity/cache v0.3.2/go.mod h1:Pa9ZNPuoNu/GztvBSKk9J1cDJW6vk/n0zLtV4mgd8N8=
++github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.1 h1:FPKJS1T+clwv+OLGt13a8UjqeRuh0O4SJ3lUriThc+4=
++github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.1/go.mod h1:j2chePtV91HrC22tGoRX3sGY42uF13WzmmV80/OdVAA=
++github.com/AzureAD/microsoft-authentication-extensions-for-go/cache v0.1.1 h1:WJTmL004Abzc5wDB5VtZG2PJk5ndYDgVacGqfirKxjM=
++github.com/AzureAD/microsoft-authentication-extensions-for-go/cache v0.1.1/go.mod h1:tCcJZ0uHAmvjsVYzEFivsRTN00oz5BEsRgQHu5JZ9WE=
++github.com/AzureAD/microsoft-authentication-library-for-go v1.4.2 h1:oygO0locgZJe7PpYPXT5A29ZkwJaPqcva7BVeemZOZs=
++github.com/AzureAD/microsoft-authentication-library-for-go v1.4.2/go.mod h1:wP83P5OoQ5p6ip3ScPr0BAq0BvuPAvacpEuSzyouqAI=
+ github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
+ github.com/BurntSushi/toml v1.4.0/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=
+ github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
+@@ -82,6 +94,8 @@ github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSs
+ github.com/dgryski/go-farm v0.0.0-20140601200337-fc41e106ee0e/go.mod h1:SqUrOPUnsFjfmXRMNPybcSiG0BgUW2AuFH8PAnS2iTw=
+ github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da h1:aIftn67I1fkbMa512G+w+Pxci9hJPB8oMnkcP3iZF38=
+ github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da/go.mod h1:SqUrOPUnsFjfmXRMNPybcSiG0BgUW2AuFH8PAnS2iTw=
++github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/rVNCu3HqELle0jiPLLBs70cWOduZpkS1E78=
++github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
+ github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
+ github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
+ github.com/emirpasic/gods v1.18.1 h1:FXtiHYKDGKCW2KzwZKx0iC0PQmdlorYgdFG9jPXJ1Bc=
+@@ -127,6 +141,8 @@ github.com/gogo/protobuf v1.3.2 h1:Ov1cvc58UF3b5XjBnZv7+opcTcQFZebYjWzi34vdm4Q=
+ github.com/gogo/protobuf v1.3.2/go.mod h1:P1XiOD3dCwIKUDQYPy72D8LYyHL2YPYrpS2s69NZV8Q=
+ github.com/golang-jwt/jwt/v4 v4.5.2 h1:YtQM7lnr8iZ+j5q71MGKkNw9Mn7AjHM68uc9g5fXeUI=
+ github.com/golang-jwt/jwt/v4 v4.5.2/go.mod h1:m21LjoU+eqJr34lmDMbreY2eSTRJ1cv77w39/MY0Ch0=
++github.com/golang-jwt/jwt/v5 v5.2.2 h1:Rl4B7itRWVtYIHFrSNd7vhTiz9UpLdi6gZhZ3wEeDy8=
++github.com/golang-jwt/jwt/v5 v5.2.2/go.mod h1:pqrtFR0X4osieyHYxtmOUWsAWrfe1Q5UVIyoH402zdk=
+ github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0/go.mod h1:E/TSTwGwJL78qG/PmXZO1EjYhfJinVAhrmmHX6Z8B9k=
+ github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b/go.mod h1:SBH7ygxi8pfUlaOkMMuAQtPIUF8ecWP5IEl/CR7VP2Q=
+ github.com/golang/mock v1.1.1/go.mod h1:oTYuIxOrZwtPieC+H1uAHpcLFnEyAGVDL/k47Jfbm0A=
+@@ -193,6 +209,8 @@ github.com/josharian/intern v1.0.0/go.mod h1:5DoeVV0s6jJacbCEi61lwdGj/aVlrQvzHFF
+ github.com/jstemmer/go-junit-report/v2 v2.1.0 h1:X3+hPYlSczH9IMIpSC9CQSZA0L+BipYafciZUWHEmsc=
+ github.com/jstemmer/go-junit-report/v2 v2.1.0/go.mod h1:mgHVr7VUo5Tn8OLVr1cKnLuEy0M92wdRntM99h7RkgQ=
+ github.com/jung-kurt/gofpdf v1.0.3-0.20190309125859-24315acbbda5/go.mod h1:7Id9E/uU8ce6rXgefFLlgrJj/GYY22cpxn+r32jIOes=
++github.com/keybase/go-keychain v0.0.1 h1:way+bWYa6lDppZoZcgMbYsvC7GxljxrskdNInRtuthU=
++github.com/keybase/go-keychain v0.0.1/go.mod h1:PdEILRW3i9D8JcdM+FmY6RwkHGnhHxXwkPPMeUgOK1k=
+ github.com/kisielk/errcheck v1.5.0/go.mod h1:pFxgyoBC7bSaBwPgfKdkLd5X25qrDl4LWUI2bnpBCr8=
+ github.com/kisielk/gotool v1.0.0/go.mod h1:XhKaO+MFFWcvkIS/tQcRk01m1F5IRFswLeQ+oQHNcck=
+ github.com/klauspost/compress v1.18.0 h1:c/Cqfb0r+Yi+JtIEq73FWXVkRonBlf0CRNYc8Zttxdo=
+@@ -241,6 +259,8 @@ github.com/opentracing/opentracing-go v1.2.0 h1:uEJPy/1a5RIPAJ0Ov+OIO8OxWu77jEv+
+ github.com/opentracing/opentracing-go v1.2.0/go.mod h1:GxEUsuufX4nBwe+T+Wl9TAgYrxe9dPLANfrWvHYVTgc=
+ github.com/pborman/uuid v1.2.1 h1:+ZZIw58t/ozdjRaXh/3awHfmWRbzYxJoAdNJxe/3pvw=
+ github.com/pborman/uuid v1.2.1/go.mod h1:X/NO0urCmaxf9VXbdlT7C2Yzkj2IKimNn4k+gtPdI/k=
++github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c h1:+mdjkGKdHQG3305AYmdv1U2eRNDiU2ErMBj1gwrq8eQ=
++github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c/go.mod h1:7rwL4CYBLnjLxUqIJNnCWiEdr3bn6IUYi15bNlnbCCU=
+ github.com/pkg/errors v0.8.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+ github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
+ github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+@@ -264,6 +284,8 @@ github.com/prometheus/procfs v0.16.0/go.mod h1:8veyXUu3nGP7oaCxhX6yeaM5u4stL2FeM
+ github.com/rcrowley/go-metrics v0.0.0-20141108142129-dee209f2455f/go.mod h1:bCqnVzQkZxMG4s8nGwiZ5l3QUCyqpo9Y+/ZMZ9VjZe4=
+ github.com/rcrowley/go-metrics v0.0.0-20201227073835-cf1acfcdf475 h1:N/ElC8H3+5XpJzTSTfLsJV/mx9Q9g7kxmchpfZyxgzM=
+ github.com/rcrowley/go-metrics v0.0.0-20201227073835-cf1acfcdf475/go.mod h1:bCqnVzQkZxMG4s8nGwiZ5l3QUCyqpo9Y+/ZMZ9VjZe4=
++github.com/redis/go-redis/v9 v9.8.0 h1:q3nRvjrlge/6UD7eTu/DSg2uYiU2mCL0G/uzBWqhicI=
++github.com/redis/go-redis/v9 v9.8.0/go.mod h1:huWgSWd8mW6+m0VPhJjSSQ+d6Nh1VICQ6Q5lHuCH/Iw=
+ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
+ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
+ github.com/rivo/uniseg v0.2.0/go.mod h1:J6wj4VEh+S6ZtnVlnTBMWIodfgj8LQOQFoIToxlJtxc=
+@@ -400,8 +422,8 @@ golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550/go.mod h1:yigFU9vqHzYiE8U
+ golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9/go.mod h1:LzIPMQfyMNhhGPhUkYOs5KpL4U8rLKemX1yGLhDgUto=
+ golang.org/x/crypto v0.0.0-20210921155107-089bfa567519/go.mod h1:GvvjBRRGRdwPK5ydBHafDWAxML/pGHZbMvKqRZ5+Abc=
+ golang.org/x/crypto v0.14.0/go.mod h1:MVFd36DqK4CsrnJYDkBA3VC4m2GkXAM0PvzMCn4JQf4=
+-golang.org/x/crypto v0.36.0 h1:AnAEvhDddvBdpY+uR+MyHmuZzzNqXSe/GvuDeob5L34=
+-golang.org/x/crypto v0.36.0/go.mod h1:Y4J0ReaxCR1IMaabaSMugxJES1EpwhBHhv2bDHklZvc=
++golang.org/x/crypto v0.38.0 h1:jt+WWG8IZlBnVbomuhg2Mdq0+BBQaHbtqHEFEigjUV8=
++golang.org/x/crypto v0.38.0/go.mod h1:MvrbAqul58NNYPKnOra203SB9vpuZW0e+RRZV+Ggqjw=
+ golang.org/x/exp v0.0.0-20180321215751-8460e604b9de/go.mod h1:CJ0aWSM057203Lf6IL+f9T1iT9GByDxfZKAQTCR3kQA=
+ golang.org/x/exp v0.0.0-20180807140117-3d87b88a115f/go.mod h1:CJ0aWSM057203Lf6IL+f9T1iT9GByDxfZKAQTCR3kQA=
+ golang.org/x/exp v0.0.0-20190121172915-509febef88a4/go.mod h1:CJ0aWSM057203Lf6IL+f9T1iT9GByDxfZKAQTCR3kQA=
+@@ -442,8 +464,8 @@ golang.org/x/net v0.0.0-20220722155237-a158d28d115b/go.mod h1:XRhObCWvk6IyKnWLug
+ golang.org/x/net v0.6.0/go.mod h1:2Tu9+aMcznHK/AK1HMvgo6xiTLG5rD5rZLDS+rp2Bjs=
+ golang.org/x/net v0.10.0/go.mod h1:0qNGK6F8kojg2nk9dLZ2mShWaEBan6FAoqfSigmmuDg=
+ golang.org/x/net v0.17.0/go.mod h1:NxSsAGuq816PNPmqtQdLE42eU2Fs7NoRIZrHJAlaCOE=
+-golang.org/x/net v0.37.0 h1:1zLorHbz+LYj7MQlSf1+2tPIIgibq2eL5xkrGk6f+2c=
+-golang.org/x/net v0.37.0/go.mod h1:ivrbrMbzFq5J41QOQh0siUuly180yBYtLp+CKbEaFx8=
++golang.org/x/net v0.40.0 h1:79Xs7wF06Gbdcg4kdCCIQArK11Z1hr5POQ6+fIYHNuY=
++golang.org/x/net v0.40.0/go.mod h1:y0hY0exeL2Pku80/zKK7tpntoX23cqL3Oa6njdgRtds=
+ golang.org/x/oauth2 v0.0.0-20180821212333-d2e6202438be/go.mod h1:N/0e6XlmueqKjAGxoOufVs8QHGRruUQn6yWY3a++T0U=
+ golang.org/x/oauth2 v0.28.0 h1:CrgCKl8PPAVtLnU3c+EDw6x11699EWlsDeWNWKdIOkc=
+ golang.org/x/oauth2 v0.28.0/go.mod h1:onh5ek6nERTohokkhCD/y2cV4Do3fxFHFuAejCkRWT8=
+@@ -455,8 +477,8 @@ golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9/go.mod h1:RxMgew5VJxzue5/jJ
+ golang.org/x/sync v0.0.0-20210220032951-036812b2e83c/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.1.0/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+-golang.org/x/sync v0.12.0 h1:MHc5BpPuC30uJk597Ri8TV3CNZcTLu6B6z4lJy+g6Jw=
+-golang.org/x/sync v0.12.0/go.mod h1:1dzgHSNfp02xaA81J2MS99Qcpr2w7fw1gpm99rleRqA=
++golang.org/x/sync v0.14.0 h1:woo0S4Yywslg6hp4eUFjTVOyKt0RookbpAHG4c1HmhQ=
++golang.org/x/sync v0.14.0/go.mod h1:1dzgHSNfp02xaA81J2MS99Qcpr2w7fw1gpm99rleRqA=
+ golang.org/x/sys v0.0.0-20180830151530-49385e6e1522/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
+ golang.org/x/sys v0.0.0-20190215142949-d0b11bdaac8a/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
+ golang.org/x/sys v0.0.0-20190312061237-fead79001313/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+@@ -475,12 +497,13 @@ golang.org/x/sys v0.0.0-20211025201205-69cdffdb9359/go.mod h1:oPkhp1MJrh7nUepCBc
+ golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20220715151400-c0bba94af5f8/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20220722155257-8c9f86f7a55f/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
++golang.org/x/sys v0.1.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.5.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.6.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.8.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.13.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+-golang.org/x/sys v0.31.0 h1:ioabZlmFYtWhL+TRYpcnNlLwhyxaM9kWTDEmfnprqik=
+-golang.org/x/sys v0.31.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
++golang.org/x/sys v0.33.0 h1:q3i8TbbEz+JRD9ywIRlyRAQbM0qF7hu24q3teo2hbuw=
++golang.org/x/sys v0.33.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
+ golang.org/x/term v0.0.0-20201126162022-7de9c90e9dd1/go.mod h1:bj7SfCRtBDWHUb9snDiAeCFNEtKQo2Wmx5Cou7ajbmo=
+ golang.org/x/term v0.0.0-20210927222741-03fcf44c2211/go.mod h1:jbD1KX2456YbFQfuXm/mYQcufACuNUgVhRMnK/tPxf8=
+ golang.org/x/term v0.5.0/go.mod h1:jMB1sMXY+tzblOD4FWmEbocvup2/aLOaQEp7JmGp78k=
+@@ -493,8 +516,8 @@ golang.org/x/text v0.3.7/go.mod h1:u+2+/6zg+i71rQMx5EYifcz6MCKuco9NR6JIITiCfzQ=
+ golang.org/x/text v0.7.0/go.mod h1:mrYo+phRRbMaCq/xk9113O4dZlRixOauAjOtrjsXDZ8=
+ golang.org/x/text v0.9.0/go.mod h1:e1OnstbJyHTd6l/uOt8jFFHp6TRDWZR/bV3emEE/zU8=
+ golang.org/x/text v0.13.0/go.mod h1:TvPlkZtksWOMsz7fbANvkp4WM8x/WCo/om8BMLbz+aE=
+-golang.org/x/text v0.23.0 h1:D71I7dUrlY+VX0gQShAThNGHFxZ13dGLBHQLVl1mJlY=
+-golang.org/x/text v0.23.0/go.mod h1:/BLNzu4aZCJ1+kcD0DNRotWKage4q2rGVAg4o22unh4=
++golang.org/x/text v0.25.0 h1:qVyWApTSYLk/drJRO5mDlNYskwQznZmkpV2c8q9zls4=
++golang.org/x/text v0.25.0/go.mod h1:WEdwpYrmk1qmdHvhkSTNPm3app7v4rsT8F2UD6+VHIA=
+ golang.org/x/time v0.11.0 h1:/bpjEDfN9tkoN/ryeYHnv5hcMlc8ncjMcM4XBk5NWV0=
+ golang.org/x/time v0.11.0/go.mod h1:CDIdPxbZBQxdj6cxyCIdrNogrJKMJ7pr37NYpMcMDSg=
+ golang.org/x/tools v0.0.0-20180525024113-a5b4c53f6e8b/go.mod h1:n7NCudcB/nEzxVGmLbDWY5pfWTLqBcC2KZ6jyYvM4mQ=
+diff --git a/temporal/tools/common/schema/types.go b/temporal/tools/common/schema/types.go
+index 9d97db7..faaf7ae 100644
+--- a/temporal/tools/common/schema/types.go
++++ b/temporal/tools/common/schema/types.go
+@@ -85,6 +85,10 @@ const (
+ 	CLIOptUser = "user"
+ 	// CLIOptPassword is the cli option for password
+ 	CLIOptPassword = "password"
++	// msft: CLIOptEnableEntraAuth is the cli option for enabling Entra ID authentication
++	CLIOptEnableEntraAuth = "enable-entra-auth"
++	// msft: CLIOptEntraScope is the cli option for resource scope
++	CLIOptEntraScope = "entra-scope"
+ 	// CLIOptAuthenticator is the cli option for allowed authenticator settings
+ 	CLIOptAllowedAuthenticators = "allowed-authenticators"
+ 	// CLIOptTimeout is the cli option for timeout
+@@ -136,6 +140,10 @@ const (
+ 	CLIFlagUser = CLIOptUser + ", u"
+ 	// CLIFlagPassword is the cli flag for password
+ 	CLIFlagPassword = CLIOptPassword + ", pw"
++	// msft: CLIFlagEnableEntraAuth is the cli flag for enabling Entra ID authentication
++	CLIFlagEnableEntraAuth = CLIOptEnableEntraAuth + ", ea"
++	// msft: CLIFlagEntraScope is the cli flag for resource scope
++	CLIFlagEntraScope = CLIOptEntraScope + ", es"
+ 	// CLIFlagAllowedAuthenticators is the cli flag for allowed authenticators
+ 	CLIFlagAllowedAuthenticators = CLIOptAllowedAuthenticators + ", aa"
+ 	// CLIFlagTimeout is the cli flag for timeout
+diff --git a/temporal/tools/sql/handler.go b/temporal/tools/sql/handler.go
+index cb25e70..1ca3b5a 100644
+--- a/temporal/tools/sql/handler.go
++++ b/temporal/tools/sql/handler.go
+@@ -146,6 +146,8 @@ func parseConnectConfig(cli *cli.Context) (*config.SQL, error) {
+ 	cfg.ConnectAddr = fmt.Sprintf("%s:%v", host, port)
+ 	cfg.User = cli.GlobalString(schema.CLIOptUser)
+ 	cfg.Password = cli.GlobalString(schema.CLIOptPassword)
++	cfg.EnableEntraAuth = cli.GlobalBool(schema.CLIOptEnableEntraAuth) // msft
++	cfg.EntraScope = cli.GlobalString(schema.CLIOptEntraScope) // msft
+ 	cfg.DatabaseName = cli.GlobalString(schema.CLIOptDatabase)
+ 	cfg.PluginName = cli.GlobalString(schema.CLIOptPluginName)
+ 
+diff --git a/temporal/tools/sql/main.go b/temporal/tools/sql/main.go
+index 5f52a08..4572056 100644
+--- a/temporal/tools/sql/main.go
++++ b/temporal/tools/sql/main.go
+@@ -58,7 +58,7 @@ func BuildCLIOptions() *cli.App {
+ 	app := cli.NewApp()
+ 	app.Name = "temporal-sql-tool"
+ 	app.Usage = "Command line tool for temporal sql operations"
+-	app.Version = "0.0.1"
++	app.Version = "0.0.2"
+ 
+ 	logger := log.NewCLILogger()
+ 
+@@ -87,6 +87,19 @@ func BuildCLIOptions() *cli.App {
+ 			Usage:  "password used for authentication when connecting to sql host",
+ 			EnvVar: "SQL_PASSWORD",
+ 		},
++		// msft: support mi auth for azure postgres
++		cli.BoolFlag{
++			Name:  schema.CLIFlagEnableEntraAuth,
++			Usage: "enable Entra ID authentication for SQL connection",
++			EnvVar: "SQL_ENABLE_ENTRA_AUTH",
++		},
++		// msft: support mi auth for azure postgres
++		cli.StringFlag{
++			Name:   schema.CLIFlagEntraScope,
++			Value:  "https://ossrdbms-aad.database.windows.net/.default",
++			Usage:  "resource scope for Entra ID authentication",
++			EnvVar: "SQL_ENTRA_SCOPE",
++		},
+ 		cli.StringFlag{
+ 			Name:   schema.CLIFlagDatabase,
+ 			Value:  "temporal",
+-- 
+2.52.0
+
