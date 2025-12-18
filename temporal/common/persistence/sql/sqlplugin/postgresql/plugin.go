@@ -28,13 +28,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/jmoiron/sqlx"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
-	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence/sql"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
@@ -58,14 +56,13 @@ var (
 
 type plugin struct {
 	d driver.Driver
-	c *azidentity.DefaultAzureCredential
 }
 
 var _ sqlplugin.Plugin = (*plugin)(nil)
 
 func init() {
-	sql.RegisterPlugin(PluginName, &plugin{&driver.PQDriver{}, nil})
-	sql.RegisterPlugin(PluginNamePGX, &plugin{&driver.PGXDriver{}, nil})
+	sql.RegisterPlugin(PluginName, &plugin{&driver.PQDriver{}})
+	sql.RegisterPlugin(PluginNamePGX, &plugin{&driver.PGXDriver{}})
 
 }
 
@@ -81,7 +78,7 @@ func (d *plugin) CreateDB(
 		if cfg.Connect != nil {
 			return cfg.Connect(cfg)
 		}
-		return d.createDBConnection(cfg, r, logger)
+		return d.createDBConnection(cfg, r)
 	}
 	needsRefresh := d.d.IsConnNeedsRefreshError
 	handle := sqlplugin.NewDatabaseHandle(connect, needsRefresh, logger, metricsHandler, clock.NewRealTimeSource())
@@ -101,7 +98,7 @@ func (d *plugin) CreateAdminDB(
 		if cfg.Connect != nil {
 			return cfg.Connect(cfg)
 		}
-		return d.createDBConnection(cfg, r, logger)
+		return d.createDBConnection(cfg, r)
 	}
 	needsRefresh := d.d.IsConnNeedsRefreshError
 	handle := sqlplugin.NewDatabaseHandle(connect, needsRefresh, logger, metricsHandler, clock.NewRealTimeSource())
@@ -116,20 +113,9 @@ func (d *plugin) CreateAdminDB(
 func (d *plugin) createDBConnection(
 	cfg *config.SQL,
 	resolver resolver.ServiceResolver,
-	logger log.Logger,
 ) (*sqlx.DB, error) {
-
-	if cfg.EnableEntraAuth && d.c == nil {
-		cred, err := azidentity.NewDefaultAzureCredential(nil)
-		if err != nil {
-			logger.Error("Failed to create default Azure credential", tag.Error(err))
-			return nil, err
-		}
-		d.c = cred
-	}
-
 	if cfg.DatabaseName != "" {
-		postgresqlSession, err := session.NewSession(cfg, d.d, resolver, d.c, logger)
+		postgresqlSession, err := session.NewSession(cfg, d.d, resolver)
 		if err != nil {
 			return nil, err
 		}
@@ -147,8 +133,6 @@ func (d *plugin) createDBConnection(
 			cfg,
 			d.d,
 			resolver,
-			d.c,
-			logger,
 		); err == nil {
 			return postgresqlSession.DB, nil
 		} else {

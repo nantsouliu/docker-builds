@@ -25,19 +25,13 @@
 package session
 
 import (
-	"context"
 	"fmt"
 	"net/url"
 	"strings"
-	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/iancoleman/strcase"
 	"github.com/jmoiron/sqlx"
 	"go.temporal.io/server/common/config"
-	"go.temporal.io/server/common/log"
-	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin/postgresql/driver"
 	"go.temporal.io/server/common/resolver"
 )
@@ -65,10 +59,8 @@ func NewSession(
 	cfg *config.SQL,
 	d driver.Driver,
 	resolver resolver.ServiceResolver,
-	cred *azidentity.DefaultAzureCredential,
-	logger log.Logger,
 ) (*Session, error) {
-	db, err := createConnection(cfg, d, resolver, cred, logger)
+	db, err := createConnection(cfg, d, resolver)
 	if err != nil {
 		return nil, err
 	}
@@ -85,14 +77,8 @@ func createConnection(
 	cfg *config.SQL,
 	d driver.Driver,
 	resolver resolver.ServiceResolver,
-	cred *azidentity.DefaultAzureCredential,
-	logger log.Logger,
 ) (*sqlx.DB, error) {
-	dsn, err := buildDSN(cfg, resolver, cred, logger)
-	if err != nil {
-		return nil, err
-	}
-	db, err := d.CreateConnection(dsn)
+	db, err := d.CreateConnection(buildDSN(cfg, resolver))
 	if err != nil {
 		return nil, err
 	}
@@ -114,40 +100,18 @@ func createConnection(
 func buildDSN(
 	cfg *config.SQL,
 	r resolver.ServiceResolver,
-	cred *azidentity.DefaultAzureCredential,
-	logger log.Logger,
-) (string, error) {
+) string {
 	tlsAttrs := buildDSNAttr(cfg).Encode()
 	resolvedAddr := r.Resolve(cfg.ConnectAddr)[0]
-
-	var passwd string
-	var err error = nil
-
-	if !cfg.EnableEntraAuth || cred == nil {
-		passwd = url.QueryEscape(cfg.Password)
-	} else {
-		token, err := getAccessTokenWithRetry(
-			cred,
-			cfg.EntraScope,
-			3,
-			logger,
-		)
-		if err != nil {
-			logger.Error(fmt.Sprintf("failed to get access token for %v: %v", cfg.ConnectAddr, err), tag.Error(err))
-		}
-		passwd = token
-	}
-
 	dsn := fmt.Sprintf(
 		dsnFmt,
 		cfg.User,
-		passwd,
+		getPassword(cfg), // msft
 		resolvedAddr,
 		cfg.DatabaseName,
 		tlsAttrs,
 	)
-
-	return dsn, err
+	return dsn
 }
 
 func buildDSNAttr(cfg *config.SQL) url.Values {
@@ -183,27 +147,4 @@ func buildDSNAttr(cfg *config.SQL) url.Values {
 		parameters.Set(key, value)
 	}
 	return parameters
-}
-
-func getAccessTokenWithRetry(cred *azidentity.DefaultAzureCredential, scope string, maxRetry int, logger log.Logger) (string, error) {
-	if maxRetry <= 0 {
-		maxRetry = 1
-	}
-
-	ctx, ctxCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer ctxCancel()
-
-	scopeArray := []string{scope}
-	for i := 0; i < maxRetry; i++ {
-		logger.Info(fmt.Sprintf("get access token for scope %v, attempt %d/%d", scope, i+1, maxRetry))
-		token, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: scopeArray})
-		if err == nil {
-			logger.Info(fmt.Sprintf("fetched the access token. token ExpiresOn: %v", token.ExpiresOn))
-			return token.Token, nil
-		}
-		logger.Error(fmt.Sprintf("failed to get access token for scope %v: %v", scope, err), tag.Error(err))
-	}
-
-	logger.Error(fmt.Sprintf("failed to get access token for scope %v after %v attempts", scope, maxRetry))
-	return "", fmt.Errorf("failed to get access token for scope %v after %v attempts", scope, maxRetry)
 }

@@ -29,7 +29,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -46,7 +45,6 @@ import (
 const (
 	// TODO: this should be dynamic config.
 	sessionRefreshMinInternal = 1 * time.Second
-	accessTokenExpireErrorMsg = "The access token has expired"
 )
 
 var (
@@ -65,6 +63,9 @@ type DatabaseHandle struct {
 	timeSource  clock.TimeSource
 	// Ensures only one refresh call happens at a time
 	sync.Mutex
+
+	// msft: For background heartbeat
+	cancel context.CancelFunc
 }
 
 // An invalid connection returns `DatabaseUnavailableError` for all operations
@@ -77,6 +78,7 @@ func NewDatabaseHandle(
 	metricsHandler metrics.Handler,
 	timeSource clock.TimeSource,
 ) *DatabaseHandle {
+	ctx, cancel := context.WithCancel(context.Background()) // msft
 	handle := &DatabaseHandle{
 		running:      true,
 		connect:      connect,
@@ -84,8 +86,10 @@ func NewDatabaseHandle(
 		metrics:      metricsHandler,
 		logger:       logger,
 		timeSource:   timeSource,
+		cancel:       cancel, // msft
 	}
 	handle.reconnect(true)
+	go handle.heartbeat(ctx) // msft
 	return handle
 }
 
@@ -143,6 +147,7 @@ func (h *DatabaseHandle) Close() {
 
 	if h.running {
 		h.running = false
+		h.cancel()
 		db := h.db.Swap(nil)
 		if db != nil {
 			db.Close()
@@ -162,25 +167,18 @@ func (h *DatabaseHandle) DB() (*sqlx.DB, error) {
 }
 
 func (h *DatabaseHandle) Conn() Conn {
-	if db := h.db.Load(); db != nil {
-		return db
-	}
-
-	if db := h.reconnect(false); db != nil {
-		return db
-	}
-	return invalidConn{}
+	return &tokenAuthConn{h: h}
 }
 
 func (h *DatabaseHandle) ConvertError(err error) error {
 	if h.needsRefresh(err) ||
+		IsAccessTokenExpiredError(err) || // msft
 		errors.Is(err, driver.ErrBadConn) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, io.EOF) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.ECONNABORTED) ||
-		errors.Is(err, syscall.ECONNREFUSED) || 
-		(err != nil && strings.Contains(err.Error(), accessTokenExpireErrorMsg)) {
+		errors.Is(err, syscall.ECONNREFUSED) {
 		h.reconnect(true)
 		return serviceerror.NewUnavailable(fmt.Sprintf("database connection lost: %s", err.Error()))
 	}

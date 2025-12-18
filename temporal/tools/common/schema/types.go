@@ -85,9 +85,9 @@ const (
 	CLIOptUser = "user"
 	// CLIOptPassword is the cli option for password
 	CLIOptPassword = "password"
-	// CLIOptEnableEntraAuth is the cli option for enabling Entra ID authentication
+	// msft: CLIOptEnableEntraAuth is the cli option for enabling Entra ID authentication
 	CLIOptEnableEntraAuth = "enable-entra-auth"
-	// CLIOptEntraScope is the cli option for resource scope
+	// msft: CLIOptEntraScope is the cli option for resource scope
 	CLIOptEntraScope = "entra-scope"
 	// CLIOptAuthenticator is the cli option for allowed authenticator settings
 	CLIOptAllowedAuthenticators = "allowed-authenticators"
@@ -140,9 +140,9 @@ const (
 	CLIFlagUser = CLIOptUser + ", u"
 	// CLIFlagPassword is the cli flag for password
 	CLIFlagPassword = CLIOptPassword + ", pw"
-	// CLIFlagEnableEntraAuth is the cli flag for enabling Entra ID authentication
+	// msft: CLIFlagEnableEntraAuth is the cli flag for enabling Entra ID authentication
 	CLIFlagEnableEntraAuth = CLIOptEnableEntraAuth + ", ea"
-	// CLIFlagEntraScope is the cli flag for resource scope
+	// msft: CLIFlagEntraScope is the cli flag for resource scope
 	CLIFlagEntraScope = CLIOptEntraScope + ", es"
 	// CLIFlagAllowedAuthenticators is the cli flag for allowed authenticators
 	CLIFlagAllowedAuthenticators = CLIOptAllowedAuthenticators + ", aa"

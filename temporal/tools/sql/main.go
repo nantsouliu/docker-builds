@@ -87,11 +87,13 @@ func BuildCLIOptions() *cli.App {
 			Usage:  "password used for authentication when connecting to sql host",
 			EnvVar: "SQL_PASSWORD",
 		},
+		// msft: support mi auth for azure postgres
 		cli.BoolFlag{
 			Name:  schema.CLIFlagEnableEntraAuth,
 			Usage: "enable Entra ID authentication for SQL connection",
 			EnvVar: "SQL_ENABLE_ENTRA_AUTH",
 		},
+		// msft: support mi auth for azure postgres
 		cli.StringFlag{
 			Name:   schema.CLIFlagEntraScope,
 			Value:  "https://ossrdbms-aad.database.windows.net/.default",
