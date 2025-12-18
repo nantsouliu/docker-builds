@@ -1,0 +1,815 @@
+From da0a7d2c327805a9050a1337ebaf8577820d5e02 Mon Sep 17 00:00:00 2001
+From: Joey Liu <nantsouliu@microsoft.com>
+Date: Thu, 18 Dec 2025 12:29:06 +0000
+Subject: [PATCH] refactoring && improve access token error handling
+
+---
+ temporal/azureml/azureauth/credentials.go     |  84 +++++++++
+ temporal/common/config/config.go              |   4 +-
+ .../persistence/sql/sqlplugin/db_handle.go    |  22 +--
+ .../sql/sqlplugin/db_handle_utils.go          | 177 ++++++++++++++++++
+ .../sql/sqlplugin/postgresql/db.go            |  34 ++--
+ .../sql/sqlplugin/postgresql/plugin.go        |  28 +--
+ .../sqlplugin/postgresql/session/session.go   |  71 +------
+ .../postgresql/session/session_utils.go       |  42 +++++
+ temporal/docker/config_template.yaml          |  10 +-
+ temporal/tools/common/schema/types.go         |   8 +-
+ temporal/tools/sql/handler.go                 |   4 +-
+ temporal/tools/sql/main.go                    |   2 +
+ 12 files changed, 357 insertions(+), 129 deletions(-)
+ create mode 100644 temporal/azureml/azureauth/credentials.go
+ create mode 100644 temporal/common/persistence/sql/sqlplugin/db_handle_utils.go
+ create mode 100644 temporal/common/persistence/sql/sqlplugin/postgresql/session/session_utils.go
+
+diff --git a/temporal/azureml/azureauth/credentials.go b/temporal/azureml/azureauth/credentials.go
+new file mode 100644
+index 0000000..10d7f69
+--- /dev/null
++++ b/temporal/azureml/azureauth/credentials.go
+@@ -0,0 +1,84 @@
++// The MIT License
++//
++// Copyright (c) 2025 Microsoft Corporation. All rights reserved.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++// THE SOFTWARE.
++
++package azureauth
++
++import (
++	"context"
++	"log/slog"
++	"os"
++	"time"
++
++	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
++	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
++	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
++)
++
++var (
++	credential  azcore.TokenCredential
++	initCredErr error
++	logger      *slog.Logger
++)
++
++func init() {
++	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
++		Level:     slog.LevelInfo,
++		AddSource: true,
++	}))
++
++	clientID := os.Getenv("AZURE_CLIENT_ID")
++	if clientID != "" {
++		credential, initCredErr = azidentity.NewManagedIdentityCredential(&azidentity.ManagedIdentityCredentialOptions{
++			ID: azidentity.ClientID(clientID),
++		})
++		if initCredErr == nil {
++			logger.Info("initialized ManagedIdentityCredential successfully", "client_id", clientID)
++		}
++	} else {
++		credential, initCredErr = azidentity.NewDefaultAzureCredential(nil)
++		if initCredErr == nil {
++			logger.Info("initialized DefaultAzureCredential successfully")
++		}
++	}
++	if initCredErr != nil {
++		logger.Error("Failed to initialize Azure credential", "error", initCredErr)
++	}
++}
++
++func GetAccessToken(scope string) (string, error) {
++	if initCredErr != nil {
++		logger.Error("azure credential is not initialized", "error", initCredErr)
++		return "", initCredErr
++	}
++
++	ctx, ctxCancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer ctxCancel()
++
++	token, err := credential.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{scope}})
++	if err == nil {
++		logger.Info("got the access token successfully", "scope", scope, "expires_on", token.ExpiresOn)
++		return token.Token, nil
++	}
++
++	logger.Error("failed to get access token", "scope", scope, "error", err)
++	return "", err
++}
+diff --git a/temporal/common/config/config.go b/temporal/common/config/config.go
+index 3e7173e..c1b0486 100644
+--- a/temporal/common/config/config.go
++++ b/temporal/common/config/config.go
+@@ -391,9 +391,9 @@ type (
+ 		User string `yaml:"user"`
+ 		// Password is the password corresponding to the user name
+ 		Password string `yaml:"password"`
+-		// EnableEntraAuth is true if the SQL plugin uses Entra ID authentication Password is ignored in this case
++		// msft: EnableEntraAuth is true if the SQL plugin uses Entra ID authentication Password is ignored in this case
+ 		EnableEntraAuth bool `yaml:"enableEntraAuth"`
+-		// EntraScope is the scope to get the access token
++		// msft: EntraScope is the scope to get the access token
+ 		EntraScope string `yaml:"entraScope"`
+ 		// PluginName is the name of SQL plugin
+ 		PluginName string `yaml:"pluginName" validate:"nonzero"`
+diff --git a/temporal/common/persistence/sql/sqlplugin/db_handle.go b/temporal/common/persistence/sql/sqlplugin/db_handle.go
+index 98293e5..c80f850 100644
+--- a/temporal/common/persistence/sql/sqlplugin/db_handle.go
++++ b/temporal/common/persistence/sql/sqlplugin/db_handle.go
+@@ -29,7 +29,6 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
+-	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"syscall"
+@@ -46,7 +45,6 @@ import (
+ const (
+ 	// TODO: this should be dynamic config.
+ 	sessionRefreshMinInternal = 1 * time.Second
+-	accessTokenExpireErrorMsg = "The access token has expired"
+ )
+ 
+ var (
+@@ -65,6 +63,9 @@ type DatabaseHandle struct {
+ 	timeSource  clock.TimeSource
+ 	// Ensures only one refresh call happens at a time
+ 	sync.Mutex
++
++	// msft: For background heartbeat
++	cancel context.CancelFunc
+ }
+ 
+ // An invalid connection returns `DatabaseUnavailableError` for all operations
+@@ -77,6 +78,7 @@ func NewDatabaseHandle(
+ 	metricsHandler metrics.Handler,
+ 	timeSource clock.TimeSource,
+ ) *DatabaseHandle {
++	ctx, cancel := context.WithCancel(context.Background()) // msft
+ 	handle := &DatabaseHandle{
+ 		running:      true,
+ 		connect:      connect,
+@@ -84,8 +86,10 @@ func NewDatabaseHandle(
+ 		metrics:      metricsHandler,
+ 		logger:       logger,
+ 		timeSource:   timeSource,
++		cancel:       cancel, // msft
+ 	}
+ 	handle.reconnect(true)
++	go handle.heartbeat(ctx) // msft
+ 	return handle
+ }
+ 
+@@ -143,6 +147,7 @@ func (h *DatabaseHandle) Close() {
+ 
+ 	if h.running {
+ 		h.running = false
++		h.cancel()
+ 		db := h.db.Swap(nil)
+ 		if db != nil {
+ 			db.Close()
+@@ -162,25 +167,18 @@ func (h *DatabaseHandle) DB() (*sqlx.DB, error) {
+ }
+ 
+ func (h *DatabaseHandle) Conn() Conn {
+-	if db := h.db.Load(); db != nil {
+-		return db
+-	}
+-
+-	if db := h.reconnect(false); db != nil {
+-		return db
+-	}
+-	return invalidConn{}
++	return &tokenAuthConn{h: h}
+ }
+ 
+ func (h *DatabaseHandle) ConvertError(err error) error {
+ 	if h.needsRefresh(err) ||
++		IsAccessTokenExpiredError(err) || // msft
+ 		errors.Is(err, driver.ErrBadConn) ||
+ 		errors.Is(err, io.ErrUnexpectedEOF) ||
+ 		errors.Is(err, io.EOF) ||
+ 		errors.Is(err, syscall.ECONNRESET) ||
+ 		errors.Is(err, syscall.ECONNABORTED) ||
+-		errors.Is(err, syscall.ECONNREFUSED) || 
+-		(err != nil && strings.Contains(err.Error(), accessTokenExpireErrorMsg)) {
++		errors.Is(err, syscall.ECONNREFUSED) {
+ 		h.reconnect(true)
+ 		return serviceerror.NewUnavailable(fmt.Sprintf("database connection lost: %s", err.Error()))
+ 	}
+diff --git a/temporal/common/persistence/sql/sqlplugin/db_handle_utils.go b/temporal/common/persistence/sql/sqlplugin/db_handle_utils.go
+new file mode 100644
+index 0000000..040cbea
+--- /dev/null
++++ b/temporal/common/persistence/sql/sqlplugin/db_handle_utils.go
+@@ -0,0 +1,177 @@
++// The MIT License
++//
++// Copyright (c) 2025 Microsoft Corporation. All rights reserved.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++// THE SOFTWARE.
++
++package sqlplugin
++
++import (
++	"context"
++	"database/sql"
++	"log/slog"
++	"os"
++	"strings"
++	"time"
++
++	"github.com/jmoiron/sqlx"
++)
++
++const (
++	accessTokenExpiredErrorMsg = "The access token has expired"
++	defaultHeartbeatInterval   = 60 * time.Second
++)
++
++var (
++	heartbeatInterval = defaultHeartbeatInterval
++	logger            *slog.Logger
++)
++
++func init() {
++	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
++		Level:     slog.LevelInfo,
++		AddSource: true,
++	}))
++
++	// AZUREML_TEMPORAL_DB_HEARTBEAT_INTERVAL should be a duration string, e.g. "60s", "1m".
++	if val := os.Getenv("AZUREML_TEMPORAL_DB_HEARTBEAT_INTERVAL"); val != "" {
++		if d, err := time.ParseDuration(val); err == nil && d > 0 {
++			heartbeatInterval = d
++			logger.Info("setting heartbeat interval from env", "interval_seconds", d.Seconds())
++		} else {
++			logger.Warn("invalid AZUREML_TEMPORAL_DB_HEARTBEAT_INTERVAL, using default", "value", val, "error", err)
++		}
++	}
++	logger.Info("heartbeat interval", "interval_seconds", heartbeatInterval.Seconds())
++}
++
++func IsAccessTokenExpiredError(err error) bool {
++	return err != nil && strings.Contains(err.Error(), accessTokenExpiredErrorMsg)
++}
++
++// utilis for DatabaseHandle start
++func (h *DatabaseHandle) WithRetry(fn func(*sqlx.DB) error) error {
++	db, err := h.DB()
++	if err != nil {
++		return err
++	}
++
++	err = fn(db)
++	if IsAccessTokenExpiredError(err) {
++		logger.Warn("access token expired, reconnecting and retrying", "error", err)
++		h.reconnect(true)
++		db, err = h.DB()
++		if err != nil {
++			return err
++		}
++		err = fn(db)
++	}
++	return err
++}
++
++func (h *DatabaseHandle) heartbeat(ctx context.Context) {
++	ticker := time.NewTicker(heartbeatInterval)
++	defer ticker.Stop()
++
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++			h.checkConnection(ctx)
++		}
++	}
++}
++
++func (h *DatabaseHandle) checkConnection(ctx context.Context) {
++	db := h.db.Load()
++	if db == nil {
++		return
++	}
++
++	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
++	defer cancel()
++
++	err := db.PingContext(pingCtx)
++
++	if err != nil {
++		if IsAccessTokenExpiredError(err) {
++			logger.Warn("heartbeat detected expired token, reconnecting", "error", err)
++			h.reconnect(true)
++		} else {
++			logger.Warn("heartbeat ping failed", "error", err)
++		}
++	}
++}
++
++// utilis for DatabaseHandle end
++
++type tokenAuthConn struct {
++	h *DatabaseHandle
++}
++
++func (c *tokenAuthConn) Rebind(query string) string {
++	db, err := c.h.DB()
++	if err != nil {
++		return query
++	}
++	return db.Rebind(query)
++}
++
++func (c *tokenAuthConn) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
++	var res sql.Result
++	err := c.h.WithRetry(func(db *sqlx.DB) error {
++		var err error
++		res, err = db.ExecContext(ctx, query, args...)
++		return err
++	})
++	return res, err
++}
++
++func (c *tokenAuthConn) NamedExecContext(ctx context.Context, query string, arg interface{}) (sql.Result, error) {
++	var res sql.Result
++	err := c.h.WithRetry(func(db *sqlx.DB) error {
++		var err error
++		res, err = db.NamedExecContext(ctx, query, arg)
++		return err
++	})
++	return res, err
++}
++
++func (c *tokenAuthConn) GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
++	return c.h.WithRetry(func(db *sqlx.DB) error {
++		return db.GetContext(ctx, dest, query, args...)
++	})
++}
++
++func (c *tokenAuthConn) SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
++	return c.h.WithRetry(func(db *sqlx.DB) error {
++		return db.SelectContext(ctx, dest, query, args...)
++	})
++}
++
++func (c *tokenAuthConn) PrepareNamedContext(ctx context.Context, query string) (*sqlx.NamedStmt, error) {
++	var stmt *sqlx.NamedStmt
++	err := c.h.WithRetry(func(db *sqlx.DB) error {
++		var err error
++		stmt, err = db.PrepareNamedContext(ctx, query)
++		return err
++	})
++	return stmt, err
++}
+diff --git a/temporal/common/persistence/sql/sqlplugin/postgresql/db.go b/temporal/common/persistence/sql/sqlplugin/postgresql/db.go
+index 2b627ba..b8aafea 100644
+--- a/temporal/common/persistence/sql/sqlplugin/postgresql/db.go
++++ b/temporal/common/persistence/sql/sqlplugin/postgresql/db.go
+@@ -92,12 +92,13 @@ func (pdb *db) conn() sqlplugin.Conn {
+ 
+ // BeginTx starts a new transaction and returns a reference to the Tx object
+ func (pdb *db) BeginTx(ctx context.Context) (sqlplugin.Tx, error) {
+-	db, err := pdb.handle.DB()
+-	if err != nil {
+-		// This error needs no conversion
+-		return nil, err
+-	}
+-	tx, err := db.BeginTxx(ctx, nil)
++	// msft: improve retry logic for access token expiry error
++	var tx *sqlx.Tx
++	err := pdb.handle.WithRetry(func(db *sqlx.DB) error {
++		var err error
++		tx, err = db.BeginTxx(ctx, nil)
++		return err
++	})
+ 	if err != nil {
+ 		return nil, pdb.handle.ConvertError(err)
+ 	}
+@@ -160,11 +161,10 @@ func (pdb *db) GetContext(ctx context.Context, dest any, query string, args ...a
+ }
+ 
+ func (pdb *db) Select(dest any, query string, args ...any) error {
+-	db, err := pdb.handle.DB()
+-	if err != nil {
+-		return err
+-	}
+-	err = db.Select(dest, query, args...)
++	// msft: improve retry logic for access token expiry error
++	err := pdb.handle.WithRetry(func(db *sqlx.DB) error {
++		return db.Select(dest, query, args...)
++	})
+ 	return pdb.handle.ConvertError(err)
+ }
+ 
+@@ -184,11 +184,13 @@ func (pdb *db) PrepareNamedContext(ctx context.Context, query string) (*sqlx.Nam
+ }
+ 
+ func (pdb *db) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+-	db, err := pdb.handle.DB()
+-	if err != nil {
+-		return nil, err
+-	}
+-	rows, err := db.QueryContext(ctx, query, args...)
++	// msft: improve retry logic for access token expiry error
++	var rows *sql.Rows
++	err := pdb.handle.WithRetry(func(db *sqlx.DB) error {
++		var err error
++		rows, err = db.QueryContext(ctx, query, args...)
++		return err
++	})
+ 	return rows, pdb.handle.ConvertError(err)
+ }
+ 
+diff --git a/temporal/common/persistence/sql/sqlplugin/postgresql/plugin.go b/temporal/common/persistence/sql/sqlplugin/postgresql/plugin.go
+index b62866e..1a02d04 100644
+--- a/temporal/common/persistence/sql/sqlplugin/postgresql/plugin.go
++++ b/temporal/common/persistence/sql/sqlplugin/postgresql/plugin.go
+@@ -28,13 +28,11 @@ import (
+ 	"fmt"
+ 	"strings"
+ 
+-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+ 	"github.com/jmoiron/sqlx"
+ 	"go.temporal.io/api/serviceerror"
+ 	"go.temporal.io/server/common/clock"
+ 	"go.temporal.io/server/common/config"
+ 	"go.temporal.io/server/common/log"
+-	"go.temporal.io/server/common/log/tag"
+ 	"go.temporal.io/server/common/metrics"
+ 	"go.temporal.io/server/common/persistence/sql"
+ 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
+@@ -58,14 +56,13 @@ var (
+ 
+ type plugin struct {
+ 	d driver.Driver
+-	c *azidentity.DefaultAzureCredential
+ }
+ 
+ var _ sqlplugin.Plugin = (*plugin)(nil)
+ 
+ func init() {
+-	sql.RegisterPlugin(PluginName, &plugin{&driver.PQDriver{}, nil})
+-	sql.RegisterPlugin(PluginNamePGX, &plugin{&driver.PGXDriver{}, nil})
++	sql.RegisterPlugin(PluginName, &plugin{&driver.PQDriver{}})
++	sql.RegisterPlugin(PluginNamePGX, &plugin{&driver.PGXDriver{}})
+ 
+ }
+ 
+@@ -81,7 +78,7 @@ func (d *plugin) CreateDB(
+ 		if cfg.Connect != nil {
+ 			return cfg.Connect(cfg)
+ 		}
+-		return d.createDBConnection(cfg, r, logger)
++		return d.createDBConnection(cfg, r)
+ 	}
+ 	needsRefresh := d.d.IsConnNeedsRefreshError
+ 	handle := sqlplugin.NewDatabaseHandle(connect, needsRefresh, logger, metricsHandler, clock.NewRealTimeSource())
+@@ -101,7 +98,7 @@ func (d *plugin) CreateAdminDB(
+ 		if cfg.Connect != nil {
+ 			return cfg.Connect(cfg)
+ 		}
+-		return d.createDBConnection(cfg, r, logger)
++		return d.createDBConnection(cfg, r)
+ 	}
+ 	needsRefresh := d.d.IsConnNeedsRefreshError
+ 	handle := sqlplugin.NewDatabaseHandle(connect, needsRefresh, logger, metricsHandler, clock.NewRealTimeSource())
+@@ -116,20 +113,9 @@ func (d *plugin) CreateAdminDB(
+ func (d *plugin) createDBConnection(
+ 	cfg *config.SQL,
+ 	resolver resolver.ServiceResolver,
+-	logger log.Logger,
+ ) (*sqlx.DB, error) {
+-
+-	if cfg.EnableEntraAuth && d.c == nil {
+-		cred, err := azidentity.NewDefaultAzureCredential(nil)
+-		if err != nil {
+-			logger.Error("Failed to create default Azure credential", tag.Error(err))
+-			return nil, err
+-		}
+-		d.c = cred
+-	}
+-
+ 	if cfg.DatabaseName != "" {
+-		postgresqlSession, err := session.NewSession(cfg, d.d, resolver, d.c, logger)
++		postgresqlSession, err := session.NewSession(cfg, d.d, resolver)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -147,8 +133,6 @@ func (d *plugin) createDBConnection(
+ 			cfg,
+ 			d.d,
+ 			resolver,
+-			d.c,
+-			logger,
+ 		); err == nil {
+ 			return postgresqlSession.DB, nil
+ 		} else {
+@@ -158,4 +142,4 @@ func (d *plugin) createDBConnection(
+ 	return nil, serviceerror.NewUnavailable(
+ 		fmt.Sprintf("unable to connect to DB, tried default DB names: %v, errors: %v", strings.Join(defaultDatabaseNames, ","), errors),
+ 	)
+-}
++}
+\ No newline at end of file
+diff --git a/temporal/common/persistence/sql/sqlplugin/postgresql/session/session.go b/temporal/common/persistence/sql/sqlplugin/postgresql/session/session.go
+index 6c8dad0..490baad 100644
+--- a/temporal/common/persistence/sql/sqlplugin/postgresql/session/session.go
++++ b/temporal/common/persistence/sql/sqlplugin/postgresql/session/session.go
+@@ -25,19 +25,13 @@
+ package session
+ 
+ import (
+-	"context"
+ 	"fmt"
+ 	"net/url"
+ 	"strings"
+-	"time"
+ 
+-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+ 	"github.com/iancoleman/strcase"
+ 	"github.com/jmoiron/sqlx"
+ 	"go.temporal.io/server/common/config"
+-	"go.temporal.io/server/common/log"
+-	"go.temporal.io/server/common/log/tag"
+ 	"go.temporal.io/server/common/persistence/sql/sqlplugin/postgresql/driver"
+ 	"go.temporal.io/server/common/resolver"
+ )
+@@ -65,10 +59,8 @@ func NewSession(
+ 	cfg *config.SQL,
+ 	d driver.Driver,
+ 	resolver resolver.ServiceResolver,
+-	cred *azidentity.DefaultAzureCredential,
+-	logger log.Logger,
+ ) (*Session, error) {
+-	db, err := createConnection(cfg, d, resolver, cred, logger)
++	db, err := createConnection(cfg, d, resolver)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -85,14 +77,8 @@ func createConnection(
+ 	cfg *config.SQL,
+ 	d driver.Driver,
+ 	resolver resolver.ServiceResolver,
+-	cred *azidentity.DefaultAzureCredential,
+-	logger log.Logger,
+ ) (*sqlx.DB, error) {
+-	dsn, err := buildDSN(cfg, resolver, cred, logger)
+-	if err != nil {
+-		return nil, err
+-	}
+-	db, err := d.CreateConnection(dsn)
++	db, err := d.CreateConnection(buildDSN(cfg, resolver))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -114,40 +100,18 @@ func createConnection(
+ func buildDSN(
+ 	cfg *config.SQL,
+ 	r resolver.ServiceResolver,
+-	cred *azidentity.DefaultAzureCredential,
+-	logger log.Logger,
+-) (string, error) {
++) string {
+ 	tlsAttrs := buildDSNAttr(cfg).Encode()
+ 	resolvedAddr := r.Resolve(cfg.ConnectAddr)[0]
+-
+-	var passwd string
+-	var err error = nil
+-
+-	if !cfg.EnableEntraAuth || cred == nil {
+-		passwd = url.QueryEscape(cfg.Password)
+-	} else {
+-		token, err := getAccessTokenWithRetry(
+-			cred,
+-			cfg.EntraScope,
+-			3,
+-			logger,
+-		)
+-		if err != nil {
+-			logger.Error(fmt.Sprintf("failed to get access token for %v: %v", cfg.ConnectAddr, err), tag.Error(err))
+-		}
+-		passwd = token
+-	}
+-
+ 	dsn := fmt.Sprintf(
+ 		dsnFmt,
+ 		cfg.User,
+-		passwd,
++		getPassword(cfg), // msft
+ 		resolvedAddr,
+ 		cfg.DatabaseName,
+ 		tlsAttrs,
+ 	)
+-
+-	return dsn, err
++	return dsn
+ }
+ 
+ func buildDSNAttr(cfg *config.SQL) url.Values {
+@@ -183,27 +147,4 @@ func buildDSNAttr(cfg *config.SQL) url.Values {
+ 		parameters.Set(key, value)
+ 	}
+ 	return parameters
+-}
+-
+-func getAccessTokenWithRetry(cred *azidentity.DefaultAzureCredential, scope string, maxRetry int, logger log.Logger) (string, error) {
+-	if maxRetry <= 0 {
+-		maxRetry = 1
+-	}
+-
+-	ctx, ctxCancel := context.WithTimeout(context.Background(), 5*time.Second)
+-	defer ctxCancel()
+-
+-	scopeArray := []string{scope}
+-	for i := 0; i < maxRetry; i++ {
+-		logger.Info(fmt.Sprintf("get access token for scope %v, attempt %d/%d", scope, i+1, maxRetry))
+-		token, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: scopeArray})
+-		if err == nil {
+-			logger.Info(fmt.Sprintf("fetched the access token. token ExpiresOn: %v", token.ExpiresOn))
+-			return token.Token, nil
+-		}
+-		logger.Error(fmt.Sprintf("failed to get access token for scope %v: %v", scope, err), tag.Error(err))
+-	}
+-
+-	logger.Error(fmt.Sprintf("failed to get access token for scope %v after %v attempts", scope, maxRetry))
+-	return "", fmt.Errorf("failed to get access token for scope %v after %v attempts", scope, maxRetry)
+-}
++}
+\ No newline at end of file
+diff --git a/temporal/common/persistence/sql/sqlplugin/postgresql/session/session_utils.go b/temporal/common/persistence/sql/sqlplugin/postgresql/session/session_utils.go
+new file mode 100644
+index 0000000..11950ba
+--- /dev/null
++++ b/temporal/common/persistence/sql/sqlplugin/postgresql/session/session_utils.go
+@@ -0,0 +1,42 @@
++// The MIT License
++//
++// Copyright (c) 2025 Microsoft Corporation. All rights reserved.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++// THE SOFTWARE.
++
++package session
++
++import (
++	"net/url"
++
++	"go.temporal.io/server/azureml/azureauth"
++	"go.temporal.io/server/common/config"
++)
++
++func getPassword(cfg *config.SQL) (string) {
++	if !cfg.EnableEntraAuth {
++		return url.QueryEscape(cfg.Password)
++	} else {
++		token, err := azureauth.GetAccessToken(cfg.EntraScope)
++		if err != nil {
++			return ""
++		}
++		return token
++	}
++}
+\ No newline at end of file
+diff --git a/temporal/docker/config_template.yaml b/temporal/docker/config_template.yaml
+index a1f23c4..c9bebac 100644
+--- a/temporal/docker/config_template.yaml
++++ b/temporal/docker/config_template.yaml
+@@ -107,8 +107,8 @@ persistence:
+                 connectProtocol: "tcp"
+                 user: "{{ default .Env.POSTGRES_USER "" }}"
+                 password: "{{ default .Env.POSTGRES_PWD "" }}"
+-                enableEntraAuth: {{ default .Env.ENABLE_ENTRA_AUTH "false" }}
+-                entraScope: "{{ default .Env.ENTRA_SCOPE "https://ossrdbms-aad.database.windows.net/.default" }}"
++                enableEntraAuth: {{ default .Env.ENABLE_ENTRA_AUTH "false" }} # msft
++                entraScope: "{{ default .Env.ENTRA_SCOPE "https://ossrdbms-aad.database.windows.net/.default" }}" # msft
+                 maxConns: {{ default .Env.SQL_MAX_CONNS "20" }}
+                 maxIdleConns: {{ default .Env.SQL_MAX_IDLE_CONNS "20" }}
+                 maxConnLifetime: {{ default .Env.SQL_MAX_CONN_TIME "1h" }}
+@@ -135,10 +135,8 @@ persistence:
+                 connectProtocol: "tcp"
+                 user: "{{ $visibility_user }}"
+                 password: "{{ $visibility_pwd }}"
+-                enableEntraAuth: {{ default .Env.ENABLE_ENTRA_AUTH "false" }}
+-                entraScope: "{{ default .Env.ENTRA_SCOPE "https://ossrdbms-aad.database.windows.net/.default" }}"
+-                maxConns: {{ default .Env.SQL_VIS_MAX_CONNS "10" }}
+-                maxIdleConns: {{ default .Env.SQL_VIS_MAX_IDLE_CONNS "10" }}
++                enableEntraAuth: {{ default .Env.ENABLE_ENTRA_AUTH "false" }} # msft
++                entraScope: "{{ default .Env.ENTRA_SCOPE "https://ossrdbms-aad.database.windows.net/.default" }}" # msft
+                 maxConnLifetime: {{ default .Env.SQL_VIS_MAX_CONN_TIME "1h" }}
+                 tls:
+                     enabled: {{ default .Env.SQL_TLS_ENABLED "false" }}
+diff --git a/temporal/tools/common/schema/types.go b/temporal/tools/common/schema/types.go
+index a6e7172..faaf7ae 100644
+--- a/temporal/tools/common/schema/types.go
++++ b/temporal/tools/common/schema/types.go
+@@ -85,9 +85,9 @@ const (
+ 	CLIOptUser = "user"
+ 	// CLIOptPassword is the cli option for password
+ 	CLIOptPassword = "password"
+-	// CLIOptEnableEntraAuth is the cli option for enabling Entra ID authentication
++	// msft: CLIOptEnableEntraAuth is the cli option for enabling Entra ID authentication
+ 	CLIOptEnableEntraAuth = "enable-entra-auth"
+-	// CLIOptEntraScope is the cli option for resource scope
++	// msft: CLIOptEntraScope is the cli option for resource scope
+ 	CLIOptEntraScope = "entra-scope"
+ 	// CLIOptAuthenticator is the cli option for allowed authenticator settings
+ 	CLIOptAllowedAuthenticators = "allowed-authenticators"
+@@ -140,9 +140,9 @@ const (
+ 	CLIFlagUser = CLIOptUser + ", u"
+ 	// CLIFlagPassword is the cli flag for password
+ 	CLIFlagPassword = CLIOptPassword + ", pw"
+-	// CLIFlagEnableEntraAuth is the cli flag for enabling Entra ID authentication
++	// msft: CLIFlagEnableEntraAuth is the cli flag for enabling Entra ID authentication
+ 	CLIFlagEnableEntraAuth = CLIOptEnableEntraAuth + ", ea"
+-	// CLIFlagEntraScope is the cli flag for resource scope
++	// msft: CLIFlagEntraScope is the cli flag for resource scope
+ 	CLIFlagEntraScope = CLIOptEntraScope + ", es"
+ 	// CLIFlagAllowedAuthenticators is the cli flag for allowed authenticators
+ 	CLIFlagAllowedAuthenticators = CLIOptAllowedAuthenticators + ", aa"
+diff --git a/temporal/tools/sql/handler.go b/temporal/tools/sql/handler.go
+index 608df67..1ca3b5a 100644
+--- a/temporal/tools/sql/handler.go
++++ b/temporal/tools/sql/handler.go
+@@ -146,8 +146,8 @@ func parseConnectConfig(cli *cli.Context) (*config.SQL, error) {
+ 	cfg.ConnectAddr = fmt.Sprintf("%s:%v", host, port)
+ 	cfg.User = cli.GlobalString(schema.CLIOptUser)
+ 	cfg.Password = cli.GlobalString(schema.CLIOptPassword)
+-	cfg.EnableEntraAuth = cli.GlobalBool(schema.CLIOptEnableEntraAuth)
+-	cfg.EntraScope = cli.GlobalString(schema.CLIOptEntraScope)
++	cfg.EnableEntraAuth = cli.GlobalBool(schema.CLIOptEnableEntraAuth) // msft
++	cfg.EntraScope = cli.GlobalString(schema.CLIOptEntraScope) // msft
+ 	cfg.DatabaseName = cli.GlobalString(schema.CLIOptDatabase)
+ 	cfg.PluginName = cli.GlobalString(schema.CLIOptPluginName)
+ 
+diff --git a/temporal/tools/sql/main.go b/temporal/tools/sql/main.go
+index 8a31508..4572056 100644
+--- a/temporal/tools/sql/main.go
++++ b/temporal/tools/sql/main.go
+@@ -87,11 +87,13 @@ func BuildCLIOptions() *cli.App {
+ 			Usage:  "password used for authentication when connecting to sql host",
+ 			EnvVar: "SQL_PASSWORD",
+ 		},
++		// msft: support mi auth for azure postgres
+ 		cli.BoolFlag{
+ 			Name:  schema.CLIFlagEnableEntraAuth,
+ 			Usage: "enable Entra ID authentication for SQL connection",
+ 			EnvVar: "SQL_ENABLE_ENTRA_AUTH",
+ 		},
++		// msft: support mi auth for azure postgres
+ 		cli.StringFlag{
+ 			Name:   schema.CLIFlagEntraScope,
+ 			Value:  "https://ossrdbms-aad.database.windows.net/.default",
+-- 
+2.52.0
+
