@@ -65,11 +65,23 @@ set -eu -o pipefail
 
 : "${SKIP_ADD_CUSTOM_SEARCH_ATTRIBUTES:=false}"
 
+: "${WAIT_FOR_SETUP_SERVER:=false}"
+
 # === Helper functions ===
 
 die() {
     echo "$*" 1>&2
     exit 1
+}
+
+temporal-sql-tool-with-retry() {
+    local wait_time=5
+
+    until temporal-sql-tool "$@"; do
+        echo "temporal-sql-tool failed. Retrying in ${wait_time} seconds..."
+        sleep ${wait_time}
+    done
+    echo "temporal-sql-tool succeeded"
 }
 
 # === Main database functions ===
@@ -206,7 +218,7 @@ setup_postgres_schema() {
     SCHEMA_DIR=${TEMPORAL_HOME}/schema/postgresql/${POSTGRES_VERSION_DIR}/temporal/versioned
     # Create database only if its name is different from the user name. Otherwise PostgreSQL container itself will create database.
     if [[ ${DBNAME} != "${POSTGRES_USER}" && ${SKIP_DB_CREATE} != true ]]; then
-        temporal-sql-tool \
+        temporal-sql-tool-with-retry \
             --plugin ${DB} \
             --ep "${POSTGRES_SEEDS}" \
             -u "${POSTGRES_USER}" \
@@ -220,7 +232,7 @@ setup_postgres_schema() {
             --tls-server-name "${POSTGRES_TLS_SERVER_NAME}" \
             create
     fi
-    temporal-sql-tool \
+    temporal-sql-tool-with-retry \
         --plugin ${DB} \
         --ep "${POSTGRES_SEEDS}" \
         -u "${POSTGRES_USER}" \
@@ -233,7 +245,7 @@ setup_postgres_schema() {
         --tls-ca-file "${POSTGRES_TLS_CA_FILE}" \
         --tls-server-name "${POSTGRES_TLS_SERVER_NAME}" \
         setup-schema -v 0.0
-    temporal-sql-tool \
+    temporal-sql-tool-with-retry \
         --plugin ${DB} \
         --ep "${POSTGRES_SEEDS}" \
         -u "${POSTGRES_USER}" \
@@ -251,7 +263,7 @@ setup_postgres_schema() {
     if [[ ${ENABLE_ES} == false ]]; then
       VISIBILITY_SCHEMA_DIR=${TEMPORAL_HOME}/schema/postgresql/${POSTGRES_VERSION_DIR}/visibility/versioned
       if [[ ${VISIBILITY_DBNAME} != "${POSTGRES_USER}" && ${SKIP_DB_CREATE} != true ]]; then
-          temporal-sql-tool \
+          temporal-sql-tool-with-retry \
               --plugin ${DB} \
               --ep "${POSTGRES_SEEDS}" \
               -u "${POSTGRES_USER}" \
@@ -265,7 +277,7 @@ setup_postgres_schema() {
               --tls-server-name "${POSTGRES_TLS_SERVER_NAME}" \
               create
       fi
-      temporal-sql-tool \
+      temporal-sql-tool-with-retry \
           --plugin ${DB} \
           --ep "${POSTGRES_SEEDS}" \
           -u "${POSTGRES_USER}" \
@@ -278,7 +290,7 @@ setup_postgres_schema() {
           --tls-ca-file "${POSTGRES_TLS_CA_FILE}" \
           --tls-server-name "${POSTGRES_TLS_SERVER_NAME}" \
           setup-schema -v 0.0
-      temporal-sql-tool \
+      temporal-sql-tool-with-retry \
           --plugin ${DB} \
           --ep "${POSTGRES_SEEDS}" \
           -u "${POSTGRES_USER}" \
@@ -429,5 +441,19 @@ if [[ ${ENABLE_ES} == true ]]; then
     setup_es_index
 fi
 
-# Run this func in parallel process. It will wait for server to start and then run required steps.
-setup_server &
+if [[ ${WAIT_FOR_SETUP_SERVER} == true ]]; then
+    # In k8s job context, run setup_server synchronously and exit
+    echo "Starting server setup (synchronous)..."
+    setup_server
+    echo "Server setup complete."
+
+    # Terminate istio proxy if running in istio-injected pod
+    if command -v curl &> /dev/null && curl -s -f http://localhost:15020/healthz/ready &> /dev/null; then
+        echo "Terminating istio proxy..."
+        curl -s -XPOST http://localhost:15020/quitquitquit || true
+        sleep 10
+    fi
+else
+    # Run this func in parallel process. It will wait for server to start and then run required steps.
+    setup_server &
+fi
