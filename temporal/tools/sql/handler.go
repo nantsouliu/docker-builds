@@ -146,6 +146,8 @@ func parseConnectConfig(cli *cli.Context) (*config.SQL, error) {
 	cfg.ConnectAddr = fmt.Sprintf("%s:%v", host, port)
 	cfg.User = cli.GlobalString(schema.CLIOptUser)
 	cfg.Password = cli.GlobalString(schema.CLIOptPassword)
+	cfg.EnableEntraAuth = cli.GlobalBool(schema.CLIOptEnableEntraAuth) // msft
+	cfg.EntraScope = cli.GlobalString(schema.CLIOptEntraScope) // msft
 	cfg.DatabaseName = cli.GlobalString(schema.CLIOptDatabase)
 	cfg.PluginName = cli.GlobalString(schema.CLIOptPluginName)
 

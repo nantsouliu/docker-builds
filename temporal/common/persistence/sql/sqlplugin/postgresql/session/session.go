@@ -106,7 +106,7 @@ func buildDSN(
 	dsn := fmt.Sprintf(
 		dsnFmt,
 		cfg.User,
-		url.QueryEscape(cfg.Password),
+		getPassword(cfg), // msft
 		resolvedAddr,
 		cfg.DatabaseName,
 		tlsAttrs,
