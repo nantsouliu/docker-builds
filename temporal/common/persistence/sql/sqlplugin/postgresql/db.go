@@ -68,12 +68,13 @@ func (pdb *db) conn() sqlplugin.Conn {
 
 // BeginTx starts a new transaction and returns a reference to the Tx object
 func (pdb *db) BeginTx(ctx context.Context) (sqlplugin.Tx, error) {
-	db, err := pdb.handle.DB()
-	if err != nil {
-		// This error needs no conversion
-		return nil, err
-	}
-	tx, err := db.BeginTxx(ctx, nil)
+	// msft: improve retry logic for access token expiry error
+	var tx *sqlx.Tx
+	err := pdb.handle.WithRetry(func(db *sqlx.DB) error {
+		var err error
+		tx, err = db.BeginTxx(ctx, nil)
+		return err
+	})
 	if err != nil {
 		return nil, pdb.handle.ConvertError(err)
 	}
@@ -136,11 +137,10 @@ func (pdb *db) GetContext(ctx context.Context, dest any, query string, args ...a
 }
 
 func (pdb *db) Select(dest any, query string, args ...any) error {
-	db, err := pdb.handle.DB()
-	if err != nil {
-		return err
-	}
-	err = db.Select(dest, query, args...)
+	// msft: improve retry logic for access token expiry error
+	err := pdb.handle.WithRetry(func(db *sqlx.DB) error {
+		return db.Select(dest, query, args...)
+	})
 	return pdb.handle.ConvertError(err)
 }
 
@@ -160,11 +160,13 @@ func (pdb *db) PrepareNamedContext(ctx context.Context, query string) (*sqlx.Nam
 }
 
 func (pdb *db) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	db, err := pdb.handle.DB()
-	if err != nil {
-		return nil, err
-	}
-	rows, err := db.QueryContext(ctx, query, args...)
+	// msft: improve retry logic for access token expiry error
+	var rows *sql.Rows
+	err := pdb.handle.WithRetry(func(db *sqlx.DB) error {
+		var err error
+		rows, err = db.QueryContext(ctx, query, args...)
+		return err
+	})
 	return rows, pdb.handle.ConvertError(err)
 }
 
